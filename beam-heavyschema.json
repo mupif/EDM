@@ -1,0 +1,64 @@
+[
+	{
+		"_schema": { "name": "DMS01.Beam", "naming":"property" },
+		"length": { "dtype": "f", "unit": "m" },
+		"height": { "dtype": "f", "unit": "m" },
+		"density": { "dtype": "f", "unit": "kg/m3" },
+		"bc_0": { "dtype": "bool", "shape": [3] },
+		"bc_1": { "dtype": "bool", "shape": [3] },
+		"cs_raw": { "dtype": "int" },
+		"cs": { "indexed": "cs_raw", "path": "DMS01.CrossSection" }
+	},
+	{
+		"_schema": { "name": "DMS01.CrossSection", "naming":"property" },
+		"rvePosition": { "dtype": "f", "shape": [3], "unit":"m" },
+		"rve_raw": { "dtype": "int" },
+		"rve": { "indexed": "rve_raw", "path": "DMS01.ConcreteRVE" }
+	},
+	{
+		"_schema": { "name": "DMS01.ConcreteRVE", "naming":"property" },
+		"ct_raw": { "dtype": "int" },
+		"ct": { "indexed":"ct_raw", "path": "DMS01.CTScan" },
+		"origins": { "dtype": "f", "shape": [3], "unit":"mm" },
+		"size": { "dtype": "f", "shape": [3], "unit":"mm" },
+		"materials_raw": { "dtype":"int", "shape": "variable" },
+		"materials": { "indexed":"materials_raw", "path": "DMS01.MaterialRecord" }
+	},
+	{
+		"_schema": { "name": "DMS01.CTScan", "naming":"property" },
+		"image": { "dtype": "a" },
+		"id": { "dtype": "i" }
+	},
+	{
+		"_schema": { "name": "DMS01.BeamState", "naming":"property" },
+		"beam_raw": { "dtype": "int" },
+		"beam": { "indexed":"beam_raw", "path": "DMS01.Beam" },
+		"cs_raw": { "dtype": "int" },
+		"cs": { "indexed":"cs_raw", "path": "DMS01.CrossSection" },
+		"npointz": { "dtype": "i" },
+		"csState_raw": { "dtype": "int", "shape":"variable" },
+		"csState": { "indexed":"csState_raw", "path": "DMS01.CrossSectionState" }
+	},
+	{
+		"_schema": { "name": "DMS01.CrossSectionState", "naming":"property" },
+		"rveStates_raw": { "dtype": "int", "shape":"variable" },
+		"rveStates": { "indexed":"rveStates_raw", "path": "DMS01.ConcreteRVEState" },
+		"bendingMoment": { "dtype":"f", "unit":"N*m" },
+		"kappa": { "dtype":"f" },
+		"eps_axial": { "dtype":"f", "unit":"um/m" }
+	},
+	{
+		"_schema": { "name": "DMS01.ConcreteRVEState", "naming":"property" },
+		"rve_raw": { "dtype": "int" },
+		"rve": { "indexed":"rve_raw", "path": "DMS01.ConcreteRVE" },
+		"sigmaHom": { "dtype": "f", "unit":"Pa" },
+		"epsHom": { "dtype": "f", "unit":"um/m" },
+		"stiffness": { "dtype": "f", "unit":"Pa" },
+		"eps0hom": { "dtype": "f", "unit":"um/m" }
+	},
+	{
+		"_schema": { "name": "DMS01.MaterialRecord", "naming":"property" },
+		"name": { "dtype": "a" },
+		"props": { "dtype": "json" }
+	}
+]
