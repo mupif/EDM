@@ -8,6 +8,9 @@ import typing
 import sys
 import os
 import logging
+import weakref
+import enum
+import contextlib
 logging.basicConfig()
 log=logging.getLogger()
 
@@ -58,6 +61,7 @@ class DmsFileBackend(object):
     def doc_save(self,data,coll,index=-1):
         # print(f'{self=} {coll=} {index=}')
         if index<0:
+            # write new copy
             index=0
             while os.path.exists(f:=self._fn(coll,index)): index+=1
             os.makedirs(os.path.dirname(f),exist_ok=True)
@@ -65,6 +69,7 @@ class DmsFileBackend(object):
             open(f,'w').write(data.json())
             return index
         else:
+            # modify in-place
             open(f,'w').write(data.json())
             return None
     def doc_load(self,coll,index):
@@ -74,6 +79,22 @@ class DmsFileBackend(object):
     def coll_list(self,coll):
         ff=glob.glob('{self.root}/{coll}/[0-9]*.json')
         return sorted([int(f=os.path.splitext(f)[0]) for f in ff if f.isnumeric()])
+
+class MongodbBackend(object):
+    def __init__(self,db):
+        self.db=db
+    def doc_save(self,data,coll,index=-1):
+        if index<0:
+            id_=self.db[coll].insert_one(data)
+            return id_
+        else:
+            self.db[coll].update_one(data)
+    def doc_load(self,coll,index):
+        return self.db[coll].find_one(filter=index)
+    def doc_delete(self,coll,index):
+        self.db[coll].delete_one(filter=index)
+    def coll_list(self,coll):
+        return sorted(self.db[coll].find(filter=None,retur_key=True))
 
 raw=json.loads(open('dms-schema.json').read())
 # print(raw)
@@ -85,14 +106,34 @@ schema=SchemaSchema.parse_obj(raw)
 # import dataclasses
 
 class DbContext(pydantic.BaseModel):
+    class Writing(enum.Enum):
+        NEVER_DIRTY=0 # this is true only at construction time — allows any modifications to attribute
+        IN_PLACE=1 # modifies data and writes them back
+        COPY_ON_WRITE=1 # writes duplicate object and all its parents
+        LOCKED=2
+        FROZEN=3
+
     klassMap: typing.Dict[str,type]=pydantic.Field(...,exclude=True)
     conn: typing.Any=None
-    table: str=''
+    # table: str=''
     index: int=-1
     path: str=''
+    dirty: bool=True
+    writing: Writing=Writing.NEVER_DIRTY
+
+
     def _copy(self,subpath):
         return DbContext(klassMap=self.klassMap,conn=self.conn,path=self.path+'.'+subpath)
-    def __repr_args__(self): return [(k,getattr(self,k)) for k in ('conn','table','index','path')]
+    def __repr_args__(self): return [(k,getattr(self,k)) for k in ('conn','index','path','writing','dirty')]
+    def load(self,coll,index,path):
+        data=self.conn.doc_load(coll,index)
+        ctx=self._copy(subpath='')
+        ctx.path=path
+        # ctx.table=coll
+        ctx.index=index
+        ctx.dirty=False
+        print(f'Loading {coll=}, {index=}: {data=}')
+        return self.klassMap[coll](ctx=ctx,parent=None,**data)
 
 
 class DmsData(dms_base.DmsBaseModel):
@@ -103,6 +144,7 @@ class DmsData(dms_base.DmsBaseModel):
 
 @pydantic.dataclasses.dataclass
 class DocBase:
+
     ctx: typing.Optional[DbContext]=None
     data: DmsData=pydantic.Field(default_factory=DmsData)
     parent: typing.Any=None
@@ -110,24 +152,37 @@ class DocBase:
     def set_children_parents(self):
         for attr,item in self._db_fields.items():
             if item.link is None: continue
-            if len(item.shape)==0: self.data[attr].parent=self
+            if len(item.shape)==0:
+                if not isinstance(self.data[attr],int): self.data[attr].parent=weakref.ref(self)
             else:
                 for obj in self.data[attr]:
                     if isinstance(obj,int): continue
-                    obj.parent=self
-    def is_dirty(self): return not self.ctx or (self.ctx.table=='' and self.ctx.index<0)
+                    obj.parent=weakref.ref(self)
+    # def is_dirty(self): return not self.ctx or (self.ctx.table=='' and self.ctx.index<0)
+    def is_dirty(self): return not self.ctx or self.ctx.dirty
     def set_dirty(self):
         # print(f' XX {self.__class__.__name__} {self.ctx.path=}')
-        if self.parent: self.parent.detach_child(self)
         if not self.ctx: return
-        self.ctx.table=''
-        self.ctx.index=-1
-        if self.parent is not None: self.parent.set_dirty()
+        if self.ctx.writing==DbContext.Writing.NEVER_DIRTY: return
+        if self.ctx.writing in (DbContext.Writing.FROZEN,DbContext.Writing.LOCKED): raise RuntimeError('Frozen or locked object (programming error; this should not happen).')
+        self.ctx.dirty=True
+        if self.ctx.writing==DbContext.Writing.COPY_ON_WRITE:
+            print(f'{self.ctx.path}: COPY_ON_WRITE, {self.parent=}')
+            if self.parent and (p:=self.parent()): p.detach_child(self)
+            self.ctx.index=-1
+            if self.parent and (p:=self.parent()): p.set_dirty()
+
+    def assert_writeable(self):
+        if not self.ctx: return
+        if self.ctx.writing==DbContext.Writing.FROZEN: raise RuntimeError(f'{self.ctx.path}: frozen object, writing impossible.')
+        if self.ctx.writing==DbContext.Writing.LOCKED: raise RuntimeError(f'{self.ctx.path}: locked object, call unlock() to allow copy-on-write.')
+        if self.ctx.writing in (DbContext.Writing.NEVER_DIRTY,DbContext.Writing.IN_PLACE,DbContext.Writing.COPY_ON_WRITE): return
+        raise RuntimeError(f'{self.ctx.path}: unhandled value for {self.ctx.writing=}')
     def detach_child(self,child):
         # find child in links (single or list)
         if child.ctx is None: return
         coll=child.__class__.__name__
-        if child.ctx.table!=coll: return
+        # if child.ctx.table!=coll: return
         if child.ctx.index<0: return
         print(f'Trying to detach {coll=} {id(child)=}')
         found=False
@@ -160,9 +215,11 @@ class DocBase:
                 data=self.ctx.conn.doc_load(coll,lnk)
                 # print(f'{key=} {coll=} {lnk=}: {data=}')
                 ctx=self.ctx._copy(subpath=key+('' if ix is None else f'[{ix}]'))
-                ctx.table=coll
+                ctx.dirty=False
                 ctx.index=lnk
-                return klass(ctx=ctx,parent=self,**data)
+                ret=klass(ctx=ctx,parent=weakref.ref(self),**data)
+                ctx.writing=self.ctx.writing
+                return ret
             return lnk
         if len(item.shape)==0: return _mk_obj(self.data[key])
         else: return [_mk_obj(i,ix) for ix,i in enumerate(self.data[key])]
@@ -170,14 +227,43 @@ class DocBase:
         if not self.ctx:
             self.data[key]=value
             return
+        print(f'save_link {key=} {coll=} {value=}')
         # if self.ctx.index<0: return
         raise NotImplementedError('...')
 
+    @contextlib.contextmanager
+    def _modify(self):
+        self.assert_writeable()
+        yield
+        self.set_dirty()
+
+
+    @contextlib.contextmanager
+    def edit_clone(self):
+        if self.ctx is None: raise RuntimError(f'{self.ctx.path}: no context.')
+        if self.ctx.writing!=DbContext.Writing.LOCKED: raise RuntimeError(f'{self.ctx.path}: must be locked (not {self.ctx.writing})')
+        self.ctx.writing=DbContext.Writing.COPY_ON_WRITE
+        yield self
+        self.flush()
+
+    @contextlib.contextmanager
+    def edit_inplace(self):
+        if self.ctx is None: raise RuntimError(f'{self.ctx.path}: no context.')
+        if self.ctx.writing!=DbContext.Writing.LOCKED: raise RuntimeError(f'{self.ctx.path}: must be locked (not {self.ctx.writing})')
+        self.ctx.writing=DbContext.Writing.IN_PLACE
+        yield
+        self.flush()
+
+
+        
     def flush(self):
         if not self.ctx: raise RuntimeError('No database context, nowhere to flush.')
-        if self.ctx.table and self.ctx.index>=0: raise RuntimeError('Data clean, nothing to flush?')
-        self.ctx.table=self.__class__.__name__
+        if not self.ctx.dirty: raise RuntimeError('Data clean, nothing to flush?')
+        # if self.ctx.index>=0: raise RuntimeError('Data clean, nothing to flush?')
+        #     self.ctx.table and 
+        # self.ctx.table=self.__class__.__name__
         # traverse children
+        table=self.__class__.__name__
         for key,item in self._db_fields.items():
             if item.link is None: continue # data member
             print(f'  {key} {item.link} {self.data[key]=}')
@@ -201,29 +287,31 @@ class DocBase:
                         # if self.ctx: continue
                         if not child.is_dirty(): continue
                         c2=self.ctx._copy(subpath=f'{key}[{i}]')
-                        #print(f'  →  {key}[{i}]: {child=}')
+                        print(f'  →  {key}[{i}]: {child=}')
                         child.set_ctx(c2,overwrite=True)
                         cc.append(child.ctx.index)
-                        #print(f'  →  {key}[{i}]: {child=}')
-                #print(f'  1. {key} {item.link} {self.ctx.table} {self.ctx.index}')
+                        print(f'  →  {key}[{i}]: {child=}')
+                # print(f'  1. {key} {item.link} {self.ctx.table} {self.ctx.index}')
                 self.data[key]=cc
-                #print(f'  1. {key} {item.link} {self.ctx.table} {self.ctx.index}')
-        self.ctx.index=self.ctx.conn.doc_save(self.data,self.ctx.table)
+                print(f'  1. {key} {item.link} {self.ctx.index}')
+        self.ctx.index=self.ctx.conn.doc_save(self.data,table)
+        self.ctx.dirty=False
+        if self.ctx.writing in (DbContext.Writing.IN_PLACE,DbContext.Writing.COPY_ON_WRITE,DbContext.Writing.NEVER_DIRTY): self.ctx.writing=DbContext.Writing.LOCKED
         # print(f'Flushed {self.__class__.__name__} {id(self)=}')
 
 
     def set_ctx(self,ctx,overwrite=False):
         assert (self.ctx is None) or overwrite
         self.ctx=ctx
-        assert not self.ctx.table or overwrite
-        assert self.ctx.index<0
+        # assert not self.ctx.table or overwrite
+        # assert self.ctx.index<0
         self.flush()
 
     def __del__(self):
         if not self.ctx: return
-        if self.ctx.index==-1:
+        if self.ctx.index<0:
             # log.warning(f'{self.__class__.__name__} {id(self)=}')
-            log.warning(f'Unsaved document {self.ctx.path} being destroyed: {self.__class__.__name__}, {id(self)=} {self.data=}.')
+            log.warning(f'Unsaved document {self.ctx.path} being destroyed: {self.__class__.__name__}, {id(self)=}\n{self.data=}\n{str(self)}.')
 
 # DocBase.__classes={}
 
@@ -238,6 +326,7 @@ for klass in schema.dict().keys():
             def link_getter(self,*,key=key,item=item):
                 return self.fetch_link(key)
             def link_setter(self,val,*,key=key,item=item):
+                self.assert_writeable()
                 self.save_link(key,item.link,val)
                 self.set_dirty()
             getset=(link_getter,link_setter)
@@ -248,20 +337,21 @@ for klass in schema.dict().keys():
                 ret.flags.writeable=False
                 return ret
             def np_setter(self,val,*,key=key,F=F):
-                # print(f'np: {key=}')
-                self.data[key]=F.validate(val)
-                self.set_dirty()
+                with self._modify():
+                    self.data[key]=F.validate(val)
             getset=(np_getter,np_setter)
         elif item.dtype in ('str','bytes'):
             def strbytes_getter(self,*,key=key): return self.data[key]
             def strbytes_setter(self,val,*,key=key,item=item):
                 assert isinstance(val,{'str':str,'bytes':bytes}[item.dtype])
+                self.assert_writeable()
                 # print(f'strbytes: {key=} {val=}')
                 self.data[key]=val
                 self.set_dirty()
             getset=(strbytes_getter,strbytes_setter)
         elif item.dtype=='object':
             def json_setter(self,val,*,key=key,item=item):
+                self.assert_writeable()
                 # print(f'object: {key=}')
                 self.data[key]=json.dumps(val)
                 self.set_dirty()
@@ -274,11 +364,9 @@ for klass in schema.dict().keys():
         later={}
         for k in __attrs: later[k]=kw.pop(k)
         DocBase.__init__(self,**kw)
-        # temporarily make set_dirty no-op
-        _sd=self.set_dirty
-        self.set_dirty=lambda: None
+        assert(self.ctx is None or self.ctx.writing==DbContext.Writing.NEVER_DIRTY)
         for k,v in later.items(): setattr(self,k,v)
-        self.set_dirty=_sd
+        if self.ctx: self.ctx.writing=DbContext.Writing.LOCKED
         self.set_children_parents()
     meth['__init__']=T_init
     meth['_db_fields']=dict(kvAttrs)
@@ -294,32 +382,45 @@ backend=DmsFileBackend(root='./db-dms')
 ctx=DbContext(klassMap=klassMap,conn=backend,path='rve')
 
 if __name__=='__main__':
-    cr=ConcreteRVE(
+    rve=ConcreteRVE(
         origin=[1,2,3]*au.m,
         size=[1,1,1]*au.mm,
         materials=[mat:=MaterialRecord(name='foo',props={'origin':'CZ'})],
         ct=CTScan(id='bar',image=bytes(range(70,80))),
     )
-    #print(mat)
-    #print(cr)
-    #print(cr.materials[0].name)
-    #cr.materials[0].name='bar'
-    #print(cr.materials[0].name)
 
-    cr.set_ctx(ctx)
-    print(cr)
+    rve.set_ctx(ctx)
+
+    with rve.edit_clone():
+        rve.materials[0].name='foo2'
+
+
+    print(rve)
     # cr.flush()
-    print(f'{cr.ctx.index=}')
+    print(f'{rve.ctx.index=}')
     print(100*'=')
-    m=cr.materials[0]
+    m=rve.materials[0]
     print(100*'-')
-    #print(m)
-    m.name='foo2'
+    # print(m)
+    with rve.edit_inplace():
+        m=rve.materials[0]
+        m.name='foo2'
     print(m)
     # print(m.parent)
+    # rve.flush()
 
-    cr.flush()
-    #m.flush()
+    print(100*'@')
+    rve2=ctx.load(rve.__class__.__name__,rve.ctx.index,path='rve2')
+    print(rve2)
+
+    rve2.origin=[5,5,5]*au.km
+    print(f'{cr2.ctx.index=} {cr2.is_dirty()=}')
+    # del cr2
+    #print(cr2)
+    # cr.flush()
+
 
     #print(f' !!! {cr.materials[0].name=}')
     #cr.flush()
+
+    # unlock (detach) / lock

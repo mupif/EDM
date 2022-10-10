@@ -82,3 +82,5 @@ if __name__=='__main__':
     print('JSON:')
     print(json.loads(a.json()))
     # print_json(a.json())
+
+# convert to prescribed unit (SQL queries, unit-ignorant)

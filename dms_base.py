@@ -23,7 +23,11 @@ def quant_field(shape: List[int]=[],dtype: Union[str,np.dtype]='f8', unit: Optio
         def __get_validators__(cls): yield cls.validate
         @classmethod
         def validate(cls, val):
-            # print(f'{cls=} {cls.shape=} {cls.unit=} {cls.dtype=} {val=}')
+            # print(f'## {cls=} {cls.shape=} {cls.unit=} {cls.dtype=} {val=}')
+            if isinstance(val,dict):
+                arr=np.array(val['data'],dtype=val['dtype'])
+                if 'unit' in val: arr=arr*au.Unit(val['unit'])
+                val=arr
             if isinstance(val,(list,tuple)):
                 for item in _flatten(val):
                     if not np.can_cast(item,cls.dtype,casting='safe'): raise ValueError(f'Type mismatch: item {item} cannot be safely cast to dtype {cls.dtype}')
