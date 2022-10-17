@@ -107,13 +107,7 @@ class MongodbBackend(object):
         return sorted(self.db[coll].find(filter=None,return_key=True))
 
 raw=json.loads(open('dms-schema.json').read())
-# print(raw)
 schema=SchemaSchema.parse_obj(raw)
-# models={}
-
-#import dataclasses
-#@pydantic.dataclasses.dataclass
-# import dataclasses
 
 class DbContext(pydantic.BaseModel):
     class Writing(enum.Enum):
@@ -125,9 +119,8 @@ class DbContext(pydantic.BaseModel):
 
     klassMap: typing.Dict[str,type]=pydantic.Field(...,exclude=True)
     conn: typing.Any=None
-    # table: str=''
     index: int=-1
-    path: str=''
+    path: str='' # purely informative, for debug messages
     dirty: bool=True
     writing: Writing=Writing.NEVER_DIRTY
 
@@ -139,7 +132,6 @@ class DbContext(pydantic.BaseModel):
         data=self.conn.doc_load(coll,index)
         ctx=self._copy(subpath='')
         ctx.path=path
-        # ctx.table=coll
         ctx.index=index
         ctx.dirty=False
         print(f'Loading {coll=}, {index=}: {data=}')
@@ -167,7 +159,6 @@ class DocBase:
             else:
                 for o in self.data[attr]:
                     _obj_set_parent(o,parent=self)
-    # def is_dirty(self): return not self.ctx or (self.ctx.table=='' and self.ctx.index is None)
     def is_dirty(self): return not self.ctx or self.ctx.dirty
     def set_dirty(self):
         # print(f' XX {self.__class__.__name__} {self.ctx.path=}')
@@ -191,13 +182,12 @@ class DocBase:
         # find child in links (single or list)
         if child.ctx is None: return
         coll=child.__class__.__name__
-        # if child.ctx.table!=coll: return
         if child.ctx.index is None: return
-        print(f'Trying to detach {coll=} {id(child)=}')
+        #print(f'Trying to detach {coll=} {id(child)=}')
         found=False
         for attr,item in self._db_fields.items():
             if item.link!=coll: continue
-            print(f'  got collection {coll} for {child=}')
+            # print(f'  got collection {coll} for {child=}')
             if len(item.shape)==0:
                 if self.data[attr]==child.ctx.index:
                     self.data[attr]=child
@@ -212,7 +202,7 @@ class DocBase:
                 self.data[attr]=dd
                 # self.data[attr]=[(child if ix==child.ctx.index else ix for ix in self.data[attr])]
         # if not found: raise RuntimeError(f'Child object {child=} not found in links of {self=}')
-        if found: print('    → DETACHED ✓')
+        # if found: print('    → DETACHED ✓')
         self.set_dirty()
     def fetch_link(self,key):
         if self.ctx is None: return self.data[key]
@@ -222,7 +212,7 @@ class DocBase:
         def _mk_obj(lnk,ix=None):
             if isinstance(lnk,DocBase): return lnk
             data=self.ctx.conn.doc_load(coll,lnk)
-            print(f'**fetch_link: {key=} {coll=} {lnk=}: {data=}')
+            # print(f'**fetch_link: {key=} {coll=} {lnk=}: {data=}')
             ctx=self.ctx._copy(subpath=key+('' if ix is None else f'[{ix}]'))
             ctx.dirty=False
             ctx.index=lnk
@@ -239,23 +229,20 @@ class DocBase:
         if self.ctx is None:
             self.data[key]=value
             return
-
-        print(f'save_link {key=} {coll=} {value=}')
+        #print(f'save_link {key=} {coll=} {value=}')
         def _obj_id(obj,ix=None,*,key=key,coll=coll):
             if isinstance(obj,DocBase):
                 if not obj.is_dirty(): return obj
                 c2=self.ctx._copy(subpath=key)
-                print(f'  →  {key}{("["+str(ix)+"]") if (ix is not None) else ""}: {obj=}')
+                # print(f'  →  {key}{("["+str(ix)+"]") if (ix is not None) else ""}: {obj=}')
                 obj.set_ctx(c2,overwrite=True)
                 return obj.ctx.index
                 #cc.append(child.ctx.index)
                 #print(f'  →  {key}[{i}]: {child=}')
                 #if obj.ctx.index is None: return 
         # saving to DB context, all objects must be either indices or
-        # if self.ctx.index is None: return
-        # raise NotImplementedError('...')
-        print(f'  {key} {coll} {value=} ')
-        print(f'     {self.data.dict()=}')
+        #print(f'  {key} {coll} {value=} ')
+        #print(f'     {self.data.dict()=}')
         if scalar: self.data[key]=_obj_id(value)
         else: self.data[key]=[_obj_id(v,ix=ix) for ix,v in enumerate(value)]
 
@@ -283,7 +270,6 @@ class DocBase:
         self.flush()
 
 
-        
     def flush(self):
         if not self.ctx: raise RuntimeError('No database context, nowhere to flush.')
         if not self.ctx.dirty: raise RuntimeError('Data clean, nothing to flush?')
@@ -314,8 +300,6 @@ class DocBase:
         if self.ctx.index is None:
             # log.warning(f'{self.__class__.__name__} {id(self)=}')
             log.warning(f'Unsaved document {self.ctx.path} being destroyed: {self.__class__.__name__}, {id(self)=}\n{self.data=}\n{str(self)}.')
-
-# DocBase.__classes={}
 
 klassMap={}
 
@@ -355,9 +339,9 @@ for klass in schema.dict().keys():
             def json_setter(self,val,*,key=key,item=item):
                 self.assert_writeable()
                 # print(f'object: {key=}')
-                self.data[key]=json.dumps(val)
+                self.data[key]=json.loads(json.dumps(val))
                 self.set_dirty()
-            def json_getter(self,*,key=key,item=item): json.loads(self.data[key])
+            def json_getter(self,*,key=key,item=item): self.data[key] # json.loads(self.data[key])
             getset=(json_getter,json_setter)
         else: raise RuntimeError('Should be unreachable')
         meth[key]=property(fget=getset[0],fset=getset[1])
@@ -399,20 +383,18 @@ if __name__=='__main__':
         with rve.edit_clone():
             rve.materials[0].name='foo2'
 
-
         print(rve)
-        # cr.flush()
+
         print(f'{rve.ctx.index=}')
         print(100*'=')
+
         m=rve.materials[0]
         print(100*'-')
-        # print(m)
+
         with rve.edit_inplace():
             m=rve.materials[0]
             m.name='foo2'
         print(m)
-        # print(m.parent)
-        # rve.flush()
 
         print(100*'@')
         rve2=ctx.load(rve.__class__.__name__,rve.ctx.index,path='rve2')
@@ -421,6 +403,7 @@ if __name__=='__main__':
         with rve2.edit_inplace():
             rve2.origin=[5,5,5]*au.km
             print(f'{rve2.ctx.index=} {rve2.is_dirty()=}')
+
         # del cr2
         #print(cr2)
         # cr.flush()
