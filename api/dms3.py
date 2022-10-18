@@ -53,9 +53,6 @@ class SchemaSchema(pydantic.BaseModel):
         return root
 
 
-    
-
-
 
 
 ##
@@ -165,10 +162,10 @@ def _resolve_path_head(root: (str,str), path: Optional[str]) -> ((str,str),str):
     '''
     def _descend(klass,dbId,path,level):
         if len(path)==0: return ((klass,dbId),None)
-        obj=DB[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        obj=GG.db[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
         # print(f'{" "*level} {path=} {len(path)=} {obj=}')
         if obj is None: raise KeyError('No object {klass} with id={dbId} in the database')
-        klassSchema=getattr(schema,klass)
+        klassSchema=getattr(GG.schema,klass)
         attr,index=path[0]
         item=klassSchema[attr]
         if item.link is not None:
@@ -195,28 +192,27 @@ def root(): return 'ok'
 
 
 ##
-## schema PUT, GET
+## schema POST, GET
 ## 
 @app.post('/schema')
-def dms_api_schema_put(schema: str,force:bool=False):
-    coll=DB['schema']
+def dms_api_schema_post(schema: str,force:bool=False):
+    'Writes schema to the DB. TODO: also refresh the global GG.schema variable automatically?'
+    coll=GG.db['schema']
     if (s:=coll.find_one()) is not None and not force: raise ValueError('Schema already defined (use force=True if you are sure).')
-    DB['schema'].delete_one(s)
-    DB['schema'].insert_one(schema)
+    if s is not None: GG.db['schema'].delete_one(s)
+    GG.db['schema'].insert_one(schema)
 
 @app.get('/schema')
 def dms_api_schema_get(include_id:bool=False):
-    ret=DB['schema'].find_one()
-    if not include_id: del ret['_id']
-    # pprint(ret)
+    ret=GG.db['schema'].find_one()
+    if ret is not None and not include_id: del ret['_id']
     return ret
 
 
 @app.post('/{type}')
 def dms_api_object_post(type:str,data:dict) -> str:
-    # uses schema as compiled above; normally should be cached?
     def _new_object(klass,dta):
-        klassSchema=getattr(schema,klass)
+        klassSchema=getattr(GG.schema,klass)
         rec=dict()
         for key,val in dta.items():
             if not key in klassSchema: raise AttributeError(f'Invalid attribute {klass}.{key} (hint: {klass} defines: {", ".join(klassKeys)}).')
@@ -233,17 +229,17 @@ def dms_api_object_post(type:str,data:dict) -> str:
                 # not a link, should validate and unit-convert data
                 q=_validated_quantity(item,val)
                 rec[key]=_quantity_to_dict(q)
-        ins=DB[klass].insert_one(rec)
+        ins=GG.db[klass].insert_one(rec)
         return str(ins.inserted_id)
     return _new_object(type,data)
 
 @app.get('/{type}/{id}/object')
-def dms_api_object_get(type:str,id:str,path: Optional[str]=None, max_level:int=0) -> dict:
+def dms_api_object_get(type:str,id:str,path: Optional[str]=None, max_level:int=-1) -> dict:
     def _get_object(klass,dbId,level):
         if max_level>=0 and level>max_level: return {}
-        obj=DB[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        obj=GG.db[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
         if obj is None: raise KeyError('No object {klass} with id={dbId} in the database.')
-        klassSchema=getattr(schema,klass)
+        klassSchema=getattr(GG.schema,klass)
         ret=dict()
         for key,val in obj.items():
             if key in ('_id',): continue
@@ -271,40 +267,43 @@ def dms_api_attr_get(type:str, id:str, path:str) -> dict:
     if path2[0][1] is not None: raise ValueError(f'Path {path} has leaf index {path2[0][1]}.')
     klass,dbId=root2
     attr=path2[0][0]
-    obj=DB[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+    obj=GG.db[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
     if obj is None: raise KeyError(f'No object {klass} with id={dbId} in the database.')
-    klassSchema=getattr(schema,klass)
+    klassSchema=getattr(GG.schema,klass)
     item=klassSchema[attr]
     assert item.link is None
     return obj[attr]
 
 @app.get('/ls')
 def dms_api_type_list():
-    return list(schema.dict().keys())
+    return list(GG.schema.dict().keys())
 
 @app.get('/{type}/ls')
 def dms_api_object_list(type: str):
-    res=DB[type].find()
+    res=GG.db[type].find()
     return [str(r['_id']) for r in res]
 
 
 
+class GG(object):
+    '''Global (static) objects for the server, used throughout. Populated at startup here below'''
+    DB=None
+    schema=None
+
 ##
 ## connect to the DB
 ##
-DB=pymongo.MongoClient("localhost",27017).dms0
+GG.db=pymongo.MongoClient("localhost",27017).dms0
 ##
 ## insert schema into the DB (overwrite any existing)
 ##
-try: rawSchema=dms_api_schema_get()
-except:
+import sys
+rawSchema=dms_api_schema_get()
+if rawSchema is None:
     rawSchema=json.loads(open('dms-schema.json').read())
-    dms_api_schema_put(rawSchema,force=True)
-schema=SchemaSchema.parse_obj(rawSchema)
-
-##
-## NOTE: 'DB' and 'schema' are globals which are used inside the API functions!!
-##
+    dms_api_schema_post(rawSchema,force=True)
+    if '_id' in rawSchema: del rawSchema['_id'] # this prevents breakage when reloading
+GG.schema=SchemaSchema.parse_obj(rawSchema)
 
 
 
@@ -327,10 +326,6 @@ if __name__=='__main__':
 
 
 if 0:
-    # rawSchema=json.loads(open('dms-schema.json').read())
-    #schema=SchemaSchema.parse_obj(rawSchema)
-    #dms_api_schema_put(rawSchema,force=True)    
-    
     pprint(dms_api_schema_get())
     print(schema)
 
