@@ -1,5 +1,5 @@
 import pydantic 
-from typing import Literal,Optional,Union
+from typing import Literal,Optional,Union,Tuple
 import json
 import typing
 import re
@@ -134,7 +134,7 @@ def _parse_path(path: str) -> [(str,Optional[int])]:
     
     dot[1].notation → [('dot',1),('notation',None)]
     '''
-    if path=='': return []
+    if path=='' or path is None: return []
     pp=path.split('.')                      # split by ., dot may not appear inside [..] anyway
     pat=re.compile(r'''                  # no whitespace allowed in the expression
         (?P<stem>[a-zA-Z][a-zA-Z0-9_]*)  # stem: starts with letter, may continue with letters/numbers/_
@@ -156,16 +156,24 @@ def _quantity_to_dict(q: Union[np.ndarray,au.Quantity]) -> dict:
 
 
 
-def _resolve_path_head(root: (str,str), path: Optional[str]) -> ((str,str),str):
+@pydantic.dataclasses.dataclass
+class _ResolvedPath(object):
+    obj: typing.Any
+    type: str
+    id: str
+    tail: typing.List[Tuple[str,Optional[int]]]
+    parent: Optional[str]
+
+def _resolve_path_head(db: str,type: str, id: str, path: Optional[str]) -> _ResolvedPath:
     '''
     Resolves path head, descending as far as it can get, and returns (klass,dbId),path_tail.
     '''
-    def _descend(klass,dbId,path,level):
-        if len(path)==0: return ((klass,dbId),None)
-        obj=GG.db[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
-        # print(f'{" "*level} {path=} {len(path)=} {obj=}')
+    def _descend(klass,dbId,path,level,parentId):
+        obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        if len(path)==0: return _ResolvedPath(obj=obj,type=klass,id=dbId,tail=[],parent=None if level==0 else parentId)
+        assert len(path)>0
         if obj is None: raise KeyError('No object {klass} with id={dbId} in the database')
-        klassSchema=getattr(GG.schema,klass)
+        klassSchema=GG.schema_get_type(db,klass)
         attr,index=path[0]
         item=klassSchema[attr]
         if item.link is not None:
@@ -175,12 +183,11 @@ def _resolve_path_head(root: (str,str), path: Optional[str]) -> ((str,str),str):
             else:
                 if len(item.shape)>0: raise IndexError(f'{klass}.{attr} is a list, but was not indexed.')
                 linkId=obj[attr]
-            if len(path)==1: return ((item.link,linkId),None) # path leaf
-            else: return _descend(klass=item.link,dbId=obj[attr][index],path=path[1:],level=level+1)
+            if len(path)==1: return _ResolvedPath(obj=obj,type=item.link,id=linkId,tail=[],parent=parentId) # path leaf
+            else: return _descend(klass=item.link,dbId=obj[attr][index],path=path[1:],level=level+1,parentId=dbId)
         else:
-            return ((klass,dbId),path)
-    if path is None or path=='': return (root,None)       
-    return _descend(root[0],root[1],path=_parse_path(path),level=0)
+            return _ResolvedPath(obj=obj,type=klass,id=dbId,tail=path,parent=parentId) # ((klass,dbId),path)
+    return _descend(klass=type,dbId=id,path=_parse_path(path),level=0,parentId=id)
 
 
 
@@ -194,116 +201,136 @@ def root(): return 'ok'
 ##
 ## schema POST, GET
 ## 
-@app.post('/schema')
-def dms_api_schema_post(schema: str,force:bool=False):
+@app.post('/{db}/schema')
+def dms_api_schema_post(db: str, schema: str,force:bool=False):
     'Writes schema to the DB. TODO: also refresh the global GG.schema variable automatically?'
-    coll=GG.db['schema']
+    coll=GG.db_get(db)['schema']
     if (s:=coll.find_one()) is not None and not force: raise ValueError('Schema already defined (use force=True if you are sure).')
-    if s is not None: GG.db['schema'].delete_one(s)
+    if s is not None: GG.db_get(db)['schema'].delete_one(s)
     GG.db['schema'].insert_one(schema)
 
-@app.get('/schema')
-def dms_api_schema_get(include_id:bool=False):
-    ret=GG.db['schema'].find_one()
+@app.get('/{db}/schema')
+def dms_api_schema_get(db: str,include_id:bool=False):
+    ret=GG.db_get(db)['schema'].find_one()
+    if ret is None: raise KeyError(f'No schema defined in database {db}.')
     if ret is not None and not include_id: del ret['_id']
     return ret
 
 
-@app.post('/{type}')
-def dms_api_object_post(type:str,data:dict) -> str:
+@app.post('/{db}/{type}')
+def dms_api_object_post(db: str, type:str,data:dict) -> str:
     def _new_object(klass,dta):
-        klassSchema=getattr(GG.schema,klass)
+        klassSchema=GG.schema_get_type(db,klass)
         rec=dict()
         for key,val in dta.items():
+            if key=='_meta': continue # ignored for post
             if not key in klassSchema: raise AttributeError(f'Invalid attribute {klass}.{key} (hint: {klass} defines: {", ".join(klassKeys)}).')
             item=klassSchema[key]
             if item.link is not None:
                 rec[key]=_apply_link(item,val,lambda o: o if _is_object_id(o) else _new_object(item.link,o))
-            elif item.dtype in ('str','bytes'):
-                T={'str':str,'bytes':bytes}[item.dtype]
-                if not isinstance(val,T): raise TypeError(f'{klass}.{key} must be a {item.dtype} (not a {val.__class__.__name__})')
+            elif item.dtype=='str':
+                if not isinstance(val,str): raise TypeError(f'{klass.key} must be str (not a {val.__class__.__name__})')
+                rec[key]=val
+            elif item.dtype=='bytes':
+                if not isinstance(val,str): raise TypeError('{klass.key} must be a str (base64-encoded perhaps).')
                 rec[key]=val
             elif item.dtype=='object':
                 rec[key]=json.loads(json.dumps(val))
-            else:
-                # not a link, should validate and unit-convert data
+            else: # quantity
                 q=_validated_quantity(item,val)
                 rec[key]=_quantity_to_dict(q)
-        ins=GG.db[klass].insert_one(rec)
+        ins=GG.db_get(db)[klass].insert_one(rec)
         return str(ins.inserted_id)
     return _new_object(type,data)
 
-@app.get('/{type}/{id}/object')
-def dms_api_object_get(type:str,id:str,path: Optional[str]=None, max_level:int=-1) -> dict:
-    def _get_object(klass,dbId,level):
+@app.get('/{db}/{type}/{id}')
+def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1) -> dict:
+    def _get_object(klass,dbId,level,parentId):
         if max_level>=0 and level>max_level: return {}
-        obj=GG.db[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        assert str(obj['_id'])==dbId
         if obj is None: raise KeyError('No object {klass} with id={dbId} in the database.')
-        klassSchema=getattr(GG.schema,klass)
-        ret=dict()
+        klassSchema=GG.schema_get_type(db,klass)
+        ret=dict(_meta=dict(type=klass,parent=parentId,id=str(obj.pop('_id'))))
         for key,val in obj.items():
-            if key in ('_id',): continue
             if not key in klassSchema: raise AttributeError(f'Invalid stored attribute {klass}.{key} (not in schema).')
             item=klassSchema[key]
             if item.link is not None:
                 if level==max_level: continue
-                def _resolve(o,*,i=item,level=level): return _get_object(i.link,o,level=level+1)
+                def _resolve(o,*,i=item,level=level): return _get_object(i.link,o,level=level+1,parentId=dbId)
                 ret[key]=_apply_link(item,val,_resolve)
             else:
                 ret[key]=val
-        ret['_id']=dbId
         return ret
     root=(type,id)
-    root2,path2=_resolve_path_head(root,path)
-    if path2 is not None: raise ValueError(f'Path {path} does not lead to an object (tail: {_unparse_path(path2)}).')
-    return _get_object(root2[0],root2[1],level=0)
+    R=_resolve_path_head(db=db,type=type,id=id,path=path)
 
-@app.get('/{type}/{id}/attr')
-def dms_api_attr_get(type:str, id:str, path:str) -> dict:
-    root=(type,id)
-    root2,path2=_resolve_path_head(root,path)
-    if path2 is None or len(path2)==0: raise ValueError(f'Path {path} does leads to an object ({root2[0]}), not an attribute.')
-    if len(path2)>1: raise ValueError(f'Path {path} has too long tail ({_unparse_path(path2)}).')
-    if path2[0][1] is not None: raise ValueError(f'Path {path} has leaf index {path2[0][1]}.')
-    klass,dbId=root2
-    attr=path2[0][0]
-    obj=GG.db[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
-    if obj is None: raise KeyError(f'No object {klass} with id={dbId} in the database.')
-    klassSchema=getattr(GG.schema,klass)
-    item=klassSchema[attr]
+    if len(R.tail)==0:
+        obj=_get_object(R.type,R.id,level=0,parentId=R.parent)
+        return obj
+
+    # the result is an attribute which is yet to be obtained from the object
+    if len(R.tail)>1: raise ValueError(f'Path {path} has too long tail ({_unparse_path(R.tail)}).')
+    attr,index=R.tail[0]
+    if index is not None: raise ValueError(f'Path {path} indexes an attribute (indexing is only allowed within link array)')
+    item=GG.schema_get_type(db,R.type)[attr]
     assert item.link is None
-    return obj[attr]
+    return R.obj[attr]
 
-@app.get('/ls')
-def dms_api_type_list():
-    return list(GG.schema.dict().keys())
 
-@app.get('/{type}/ls')
-def dms_api_object_list(type: str):
-    res=GG.db[type].find()
+@app.get('/{db}')
+def dms_api_type_list(db: str):
+    return list(GG.schema_get(db).dict().keys())
+
+@app.get('/{db}/{type}')
+def dms_api_object_list(db: str, type: str):
+    res=GG.db_get(db)[type].find()
     return [str(r['_id']) for r in res]
 
 
 
 class GG(object):
     '''Global (static) objects for the server, used throughout. Populated at startup here below'''
-    DB=None
-    schema=None
+    _DB={}
+    _SCH={}
+    _cli=None
 
-##
-## connect to the DB
-##
-GG.db=pymongo.MongoClient("localhost",27017).dms0
-##
-## insert schema into the DB (overwrite any existing)
-##
-import sys
-rawSchema=dms_api_schema_get()
-if rawSchema is None:
-    rawSchema=json.loads(open('dms-schema.json').read())
-    dms_api_schema_post(rawSchema,force=True)
-    if '_id' in rawSchema: del rawSchema['_id'] # this prevents breakage when reloading
-GG.schema=SchemaSchema.parse_obj(rawSchema)
+    @staticmethod
+    def client_set(cli: pymongo.MongoClient):
+        GG._cli=cli
+    @staticmethod
+    def db_get(db:str):
+        if db not in GG._DB: GG._DB[db]=GG._cli[db]
+        return GG._DB[db]
+    @staticmethod
+    def schema_get(db:str):
+        if db not in GG._SCH:
+            rawSchema=dms_api_schema_get(db=db)
+            if '_id' in rawSchema: del rawSchema['_id'] # this prevents breakage when reloading
+            GG._SCH[db]=SchemaSchema.parse_obj(rawSchema)
+        return GG._SCH[db]
+    @staticmethod
+    def schema_get_type(db:str,type:str):
+        return getattr(GG.schema_get(db),type)
+
+    @staticmethod
+    def schema_clear_cache():
+        GG._SCH={}
+
+    @staticmethod
+    def schema_import(db:str, json_str:str, force=False):
+        rawSchema=json.loads(json_str)
+        dms_api_schema_post(rawSchema,force=force)
+        GG.schema_cache_clear()
+
+    @staticmethod
+    def schema_import_maybe(db: str, json_str:str):
+        try: s=GG.schema_get(db)
+        except KeyError:
+             GG.schema_import(db,json_str)
+
+GG.client_set(pymongo.MongoClient("localhost",27017))
+GG.schema_import_maybe('dms0',open('dms-schema.json').read())
 
 
 
@@ -326,7 +353,7 @@ if __name__=='__main__':
 
 
 if 0:
-    pprint(dms_api_schema_get())
+    pprint(dms_api_schema_get(db='dms0'))
     print(schema)
 
     ##
