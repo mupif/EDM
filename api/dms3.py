@@ -9,7 +9,7 @@ from rich.pretty import pprint
 import pymongo
 import bson
 import builtins
-
+import itertools
 
 ###
 ### SCHEMA
@@ -66,8 +66,8 @@ def _apply_link(item,o,func):
     '''Applies *func* to scalar link or list link, and returns the result (as scalar or list, depending on the schema)'''
     assert item.link is not None
     assert len(item.shape) in (0,1)
-    if len(item.shape)==1: return [func(o_) for o_ in o]
-    return func(o)
+    if len(item.shape)==1: return [func(obj=o_,index=ix) for ix,o_ in enumerate(o)]
+    return func(obj=o,index=None)
 
 from collections.abc import Iterable
 def _flatten(items, ignore_types=(str, bytes)):
@@ -206,8 +206,8 @@ def dms_api_schema_post(db: str, schema: str,force:bool=False):
     'Writes schema to the DB. TODO: also refresh the global GG.schema variable automatically?'
     coll=GG.db_get(db)['schema']
     if (s:=coll.find_one()) is not None and not force: raise ValueError('Schema already defined (use force=True if you are sure).')
-    if s is not None: GG.db_get(db)['schema'].delete_one(s)
-    GG.db['schema'].insert_one(schema)
+    if s is not None: coll.delete_one(s)
+    coll.insert_one(schema)
 
 @app.get('/{db}/schema')
 def dms_api_schema_get(db: str,include_id:bool=False):
@@ -216,18 +216,64 @@ def dms_api_schema_get(db: str,include_id:bool=False):
     if ret is not None and not include_id: del ret['_id']
     return ret
 
+@pydantic.dataclasses.dataclass
+class _ObjectTracker:
+    path2id: dict=pydantic.dataclasses.Field(default_factory=dict)
+    id2path: dict=pydantic.dataclasses.Field(default_factory=dict)
+    def add_tracked_object(self,path,id):
+        self.path2id[tuple(path)]=id
+        self.id2path[id]=tuple(path)
+    def resolve_relpath_to_id(self,*,relpath,curr):
+        tail=relpath
+        where=curr
+        while True:
+            if tail.startswith('.'):
+                tail=tail[1:]
+                where=where[:-1]
+                continue
+            dot=tail.find('.')
+            assert dot!=0
+            if dot>0: head,tail=tail[:dot],tail[dot+1:]
+            else: head,tail=tail,''
+            if m:=re.match('^(.*)\[([0-9])+\]$',head): name,ix=m.groups(1),int(m.groups(2))
+            else: name,ix=head,None
+            where.append((name,ix))
+            if tail=='': break
+        if tuple(where) not in self.path2id: raise RuntimeError(f'Unable to resolve "{relpath}" relative to "{curr}" (known objects: {" ".join([_unparse_path(p) for p in self.path2id.keys()])}')
+        return self.path2id[tuple(where)]
+    def resolve_id_to_relpath(self,*,id,curr):
+        abspath=self.id2path.get(id,None)
+        if abspath is None: return None
+        #print(f'{id=} {curr=} {abspath=}')
+        for common in itertools.count(start=0):
+            if curr[:common+1]!=abspath[:common+1]: break
+        #print(f'{common=}')
+        return (len(curr)-common-1)*'.'+_unparse_path(abspath[common:])
+
+
 
 @app.post('/{db}/{type}')
 def dms_api_object_post(db: str, type:str,data:dict) -> str:
-    def _new_object(klass,dta):
+    def _new_object(klass,dta,path,tracker):
         klassSchema=GG.schema_get_type(db,klass)
         rec=dict()
+        meta=dta.pop('_meta',None)
+        # only transfer selected metadata
+        if meta is not None: rec['_meta']={'upstream':meta['_id']}
         for key,val in dta.items():
-            if key=='_meta': continue # ignored for post
             if not key in klassSchema: raise AttributeError(f'Invalid attribute {klass}.{key} (hint: {klass} defines: {", ".join(klassKeys)}).')
             item=klassSchema[key]
             if item.link is not None:
-                rec[key]=_apply_link(item,val,lambda o: o if _is_object_id(o) else _new_object(item.link,o))
+                if len(item.shape)>0 and not isinstance(val,list): raise ValueError(f'{klass}.{key} should be list (not a {val.__class__.__name__}).')
+                def _handle_link(*,obj,index,key=key,path=path):
+                    if _is_object_id(obj): return obj
+                    elif isinstance(obj,dict):
+                        return _new_object(item.link,obj,path+[(key,index)],tracker)
+                    elif isinstance(obj,str):
+                        # relative path to an object already created, resolve it...
+                        return tracker.resolve_relpath_to_id(relpath=obj,curr=path)
+                    else: raise ValueError('{klass}.{key}: must be dict, object ID or relative path (not a {obj.__class__.__name__})')
+                rec[key]=_apply_link(item,val,_handle_link)
             elif item.dtype=='str':
                 if not isinstance(val,str): raise TypeError(f'{klass.key} must be str (not a {val.__class__.__name__})')
                 rec[key]=val
@@ -240,33 +286,47 @@ def dms_api_object_post(db: str, type:str,data:dict) -> str:
                 q=_validated_quantity(item,val)
                 rec[key]=_quantity_to_dict(q)
         ins=GG.db_get(db)[klass].insert_one(rec)
-        return str(ins.inserted_id)
-    return _new_object(type,data)
+        idStr=str(ins.inserted_id)
+        tracker.add_tracked_object(path,idStr)
+        return idStr
+    return _new_object(type,data,path=[],tracker=_ObjectTracker())
+
+@app.get('/{db}/{type}/{id}/clone')
+def dms_api_path_clone_get(db:str,type:str,id:str) -> str:
+    dump=dms_api_path_get(db=db,type=type,id=id,path=None,max_level=-1,tracking=True,meta=True)
+    return dms_api_object_post(db=db,type=type,data=dump)
+
 
 @app.get('/{db}/{type}/{id}')
-def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1) -> dict:
-    def _get_object(klass,dbId,level,parentId):
-        if max_level>=0 and level>max_level: return {}
+def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1, tracking=False, meta=True) -> dict:
+    def _get_object(klass,dbId,parentId,path,tracker):
+        if tracker and (p:=tracker.resolve_id_to_relpath(id=dbId,curr=path)): return p
+        if max_level>=0 and len(path)>max_level: return {}
         obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
         assert str(obj['_id'])==dbId
         if obj is None: raise KeyError('No object {klass} with id={dbId} in the database.')
         klassSchema=GG.schema_get_type(db,klass)
-        ret=dict(_meta=dict(type=klass,parent=parentId,id=str(obj.pop('_id'))))
+        ret={}
+        meta=ret['_meta']=obj.pop('_meta',{})
+        meta|=dict(_id=str(obj.pop('_id')),type=klass)
+        if parentId is not None: meta['parent']=parentId
+        if not meta: ret.pop('_meta')
         for key,val in obj.items():
             if not key in klassSchema: raise AttributeError(f'Invalid stored attribute {klass}.{key} (not in schema).')
             item=klassSchema[key]
             if item.link is not None:
-                if level==max_level: continue
-                def _resolve(o,*,i=item,level=level): return _get_object(i.link,o,level=level+1,parentId=dbId)
+                if len(path)==max_level: continue
+                def _resolve(*,obj,index,i=item,key=key): return _get_object(i.link,obj,parentId=dbId,path=path+[(key,index)],tracker=tracker)
                 ret[key]=_apply_link(item,val,_resolve)
             else:
                 ret[key]=val
+        if tracker: tracker.add_tracked_object(path,dbId)
         return ret
     root=(type,id)
     R=_resolve_path_head(db=db,type=type,id=id,path=path)
 
     if len(R.tail)==0:
-        obj=_get_object(R.type,R.id,level=0,parentId=R.parent)
+        obj=_get_object(R.type,R.id,parentId=R.parent,path=[],tracker=_ObjectTracker() if tracking else None)
         return obj
 
     # the result is an attribute which is yet to be obtained from the object
@@ -314,14 +374,14 @@ class GG(object):
         return getattr(GG.schema_get(db),type)
 
     @staticmethod
-    def schema_clear_cache():
+    def schema_invalidate_cache():
         GG._SCH={}
 
     @staticmethod
     def schema_import(db:str, json_str:str, force=False):
         rawSchema=json.loads(json_str)
-        dms_api_schema_post(rawSchema,force=force)
-        GG.schema_cache_clear()
+        dms_api_schema_post(db,rawSchema,force=force)
+        GG.schema_invalidate_cache()
 
     @staticmethod
     def schema_import_maybe(db: str, json_str:str):
