@@ -1,5 +1,5 @@
 import pydantic 
-from typing import Literal,Optional,Union,Tuple
+from typing import Literal,Optional,Union,Tuple,List,Set
 import json
 import typing
 import re
@@ -9,7 +9,16 @@ from rich.pretty import pprint
 import pymongo
 import bson
 import builtins
+import string
 import itertools
+
+
+from fastapi import FastAPI
+app=FastAPI()
+
+@app.get('/')
+def root(): return 'ok'
+
 
 ###
 ### SCHEMA
@@ -58,9 +67,14 @@ class SchemaSchema(pydantic.BaseModel):
 ##
 ## VARIOUS HELPER FUNCTIONS
 ##
+
+# characters used in bson IDs
+_setLowercaseNum=set(string.ascii_lowercase+string.digits)
+
 def _is_object_id(o):
     '''Desides whether *o* is string representation of bson.objectid.ObjectId'''
-    return isinstance(o,str) and len(o)==24
+    return isinstance(o,str) and len(o)==24 and set(o)<=_setLowercaseNum
+    len(o)==24
 
 def _apply_link(item,o,func):
     '''Applies *func* to scalar link or list link, and returns the result (as scalar or list, depending on the schema)'''
@@ -161,7 +175,7 @@ class _ResolvedPath(object):
     obj: typing.Any
     type: str
     id: str
-    tail: typing.List[Tuple[str,Optional[int]]]
+    tail: List[Tuple[str,Optional[int]]]
     parent: Optional[str]
 
 def _resolve_path_head(db: str,type: str, id: str, path: Optional[str]) -> _ResolvedPath:
@@ -169,11 +183,9 @@ def _resolve_path_head(db: str,type: str, id: str, path: Optional[str]) -> _Reso
     Resolves path head, descending as far as it can get, and returns (klass,dbId),path_tail.
     '''
     def _descend(klass,dbId,path,level,parentId):
-        obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        klassSchema,obj=GG.db_get_schema_object(db,klass,dbId)
         if len(path)==0: return _ResolvedPath(obj=obj,type=klass,id=dbId,tail=[],parent=None if level==0 else parentId)
         assert len(path)>0
-        if obj is None: raise KeyError('No object {klass} with id={dbId} in the database')
-        klassSchema=GG.schema_get_type(db,klass)
         attr,index=path[0]
         item=klassSchema[attr]
         if item.link is not None:
@@ -184,19 +196,36 @@ def _resolve_path_head(db: str,type: str, id: str, path: Optional[str]) -> _Reso
                 if len(item.shape)>0: raise IndexError(f'{klass}.{attr} is a list, but was not indexed.')
                 linkId=obj[attr]
             if len(path)==1: return _ResolvedPath(obj=obj,type=item.link,id=linkId,tail=[],parent=parentId) # path leaf
-            else: return _descend(klass=item.link,dbId=obj[attr][index],path=path[1:],level=level+1,parentId=dbId)
+            else:
+                return _descend(klass=item.link,dbId=(obj[attr] if index is None else obj[attr][index]),path=path[1:],level=level+1,parentId=dbId)
         else:
             return _ResolvedPath(obj=obj,type=klass,id=dbId,tail=path,parent=parentId) # ((klass,dbId),path)
     return _descend(klass=type,dbId=id,path=_parse_path(path),level=0,parentId=id)
 
 
 
-from fastapi import FastAPI
-app=FastAPI()
+@pydantic.dataclasses.dataclass
+class _LinkTracker:
+    nodes: Set[str]=pydantic.dataclasses.Field(default_factory=set)
+    edges: Set[Tuple[str,str]]=pydantic.dataclasses.Field(default_factory=set)
 
-@app.get('/')
-def root(): return 'ok'
-
+@app.get('/{db}/{type}/{id}/graph')
+def _make_link_digraph(db: str, type: str, id:str, debug:bool=False) -> Tuple[Set[str],Set[Tuple[str,str]]]:
+    def _nd(k,i): return (f'{k}\n{i}' if debug else i)
+    def _descend(klass,dbId,linkTracker):
+        klassSchema,obj=GG.db_get_schema_object(db,klass,dbId)
+        linkTracker.nodes.add(_nd(klass,dbId))
+        for key,val in obj.items():
+            if key=='_id' or key=='_meta': continue
+            item=klassSchema[key]
+            if item.link is None: continue
+            def _handle_link(*,obj,index,i=item,key=key):
+                linkTracker.edges.add((_nd(klass,dbId),_nd(i.link,obj)))
+                _descend(i.link,obj,linkTracker)
+            _apply_link(item,val,_handle_link)
+    tracker=_LinkTracker()
+    _descend(klass=type,dbId=id,linkTracker=tracker)
+    return (tracker.nodes,tracker.edges)
 
 ##
 ## schema POST, GET
@@ -291,21 +320,50 @@ def dms_api_object_post(db: str, type:str,data:dict) -> str:
         return idStr
     return _new_object(type,data,path=[],tracker=_ObjectTracker())
 
+
+#
+# FIXME: paths is a space-delimited array
+#
+@app.get('/{db}/{type}/{id}/safe-links')
+def dms_api_path_safe_links(db:str, type:str, id:str, paths:str='', debug:bool=False) -> List[str]:
+    # collect leaf IDs of modification paths
+    modIds=set()
+    for p in paths.split():
+        res=_resolve_path_head(db,type,id,p)
+        modIds.add(f'{res.type}\n{res.id}' if debug else res.id)
+    #print(f'{modIds=}')
+    # create directed graph of the current object
+    nodes,edges=_make_link_digraph(db,type,id,debug=debug)
+    import networkx as nx
+    G=nx.DiGraph()
+    G.add_nodes_from(nodes)
+    G.add_edges_from(edges)
+    assert nx.is_weakly_connected(G)
+    # collect IDs of all objects leading to modified IDs
+    viaIds=set()
+    for modId in modIds:
+        for p in nx.all_simple_paths(G,(f'{type}\n{id}' if debug else id),modId):
+            #print(f'{p=}')
+            viaIds.update(p)
+    # return IDs which are not on path to modifications
+    ret=nodes-viaIds
+    return list(ret)
+
+
 @app.get('/{db}/{type}/{id}/clone')
-def dms_api_path_clone_get(db:str,type:str,id:str) -> str:
-    dump=dms_api_path_get(db=db,type=type,id=id,path=None,max_level=-1,tracking=True,meta=True)
+def dms_api_path_clone_get(db:str,type:str,id:str,shallow:str='') -> str:
+    dump=dms_api_path_get(db=db,type=type,id=id,path=None,max_level=-1,tracking=True,meta=True,shallow=shallow)
     return dms_api_object_post(db=db,type=type,data=dump)
 
-
+#
+# FIXME: shallow is space-delimited list
+#
 @app.get('/{db}/{type}/{id}')
-def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1, tracking=False, meta=True) -> dict:
+def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1, tracking=False, meta=True, shallow:str='') -> dict:
     def _get_object(klass,dbId,parentId,path,tracker):
         if tracker and (p:=tracker.resolve_id_to_relpath(id=dbId,curr=path)): return p
         if max_level>=0 and len(path)>max_level: return {}
-        obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
-        assert str(obj['_id'])==dbId
-        if obj is None: raise KeyError('No object {klass} with id={dbId} in the database.')
-        klassSchema=GG.schema_get_type(db,klass)
+        klassSchema,obj=GG.db_get_schema_object(db,klass,dbId)
         ret={}
         meta=ret['_meta']=obj.pop('_meta',{})
         meta|=dict(_id=str(obj.pop('_id')),type=klass)
@@ -316,12 +374,17 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
             item=klassSchema[key]
             if item.link is not None:
                 if len(path)==max_level: continue
-                def _resolve(*,obj,index,i=item,key=key): return _get_object(i.link,obj,parentId=dbId,path=path+[(key,index)],tracker=tracker)
+                def _resolve(*,obj,index,i=item,key=key):
+                    # print(f'{i.link} {obj=} {shallow_=}')
+                    if obj in shallow_: return obj
+                    return _get_object(i.link,obj,parentId=dbId,path=path+[(key,index)],tracker=tracker)
                 ret[key]=_apply_link(item,val,_resolve)
             else:
                 ret[key]=val
         if tracker: tracker.add_tracked_object(path,dbId)
         return ret
+    shallow_=set(shallow.split())
+    # print(f'{shallow_=}')
     root=(type,id)
     R=_resolve_path_head(db=db,type=type,id=id,path=path)
 
@@ -362,6 +425,12 @@ class GG(object):
     def db_get(db:str):
         if db not in GG._DB: GG._DB[db]=GG._cli[db]
         return GG._DB[db]
+    @staticmethod
+    def db_get_schema_object(db:str,klass:str,dbId:str):
+        obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        assert str(obj['_id'])==dbId
+        if obj is None: raise KeyError('No object {klass} with id={dbId} in the database')
+        return GG.schema_get_type(db,klass),obj
     @staticmethod
     def schema_get(db:str):
         if db not in GG._SCH:
