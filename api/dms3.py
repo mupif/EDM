@@ -1,5 +1,5 @@
 import pydantic 
-from typing import Literal,Optional,Union,Tuple,List,Set
+from typing import Literal,Optional,Union,Tuple,List,Set,Dict
 import json
 import typing
 import re
@@ -30,6 +30,9 @@ class ItemSchema(pydantic.BaseModel):
     unit: Optional[str]=None
     shape: pydantic.conlist(item_type=int,min_items=0,max_items=5)=[]
     link: Optional[str]=None
+
+    def is_a_quantity(self):
+        return self.dtype in ('f','i','?')
 
     @pydantic.validator("unit")
     def unit_valid(cls,v):
@@ -139,7 +142,7 @@ def _validated_quantity(item: ItemSchema, data):
     if isinstance(data,abc.Sequence): return _validated_quantity_2(item,data)
     elif isinstance(data,dict):
         if extras:=(data.keys()-{'value','unit'}):
-            raise ValueError('Quantity has extra keywords: {", ".join(extras)} (only value, unit allowed).')
+            raise ValueError(f'Quantity has extra keywords: {", ".join(extras)} (only value, unit allowed).')
         return _validated_quantity_2(item,data['value'],data.get('unit',None))
     
 def _parse_path(path: str) -> [(str,Optional[int])]:
@@ -232,7 +235,7 @@ def _make_link_digraph(db: str, type: str, id:str, debug:bool=False) -> Tuple[Se
 ## 
 @app.post('/{db}/schema')
 def dms_api_schema_post(db: str, schema: str,force:bool=False):
-    'Writes schema to the DB. TODO: also refresh the global GG.schema variable automatically?'
+    'Writes schema to the DB.'
     coll=GG.db_get(db)['schema']
     if (s:=coll.find_one()) is not None and not force: raise ValueError('Schema already defined (use force=True if you are sure).')
     if s is not None: coll.delete_one(s)
@@ -280,15 +283,77 @@ class _ObjectTracker:
         return (len(curr)-common-1)*'.'+_unparse_path(abspath[common:])
 
 
+def _api_value_to_db_rec__attr(item,val,prefix):
+    'Convert API value to the DB record (for attribute)'
+    assert item.link is None
+    if item.dtype=='str':
+        if not isinstance(val,str): raise TypeError(f'{klass.key} must be str (not a {val.__class__.__name__})')
+        return val
+    elif item.dtype=='bytes':
+        if not isinstance(val,str): raise TypeError('{klass.key} must be a str (base64-encoded perhaps).')
+        return val
+    elif item.dtype=='object':
+        return json.loads(json.dumps(val))
+    elif item.is_a_quantity():
+        q=_validated_quantity(item,val)
+        return _quantity_to_dict(q)
+    else: raise NotImplementedError(f'{prefix}: unable to convert API data to database record?? {item=}')
+
+def _db_rec_to_api_value__attr(item,dbrec,prefix):
+    'Convert DB record to API value (for attribute)'
+    assert item.link is None
+    if item.dtype=='str': return dbrec
+    elif item.dtype=='bytes': return dbrec
+    elif item.dtype=='object': return dbrec
+    elif item.is_a_quantity():
+        return dbrec
+    else: raise NotImplementedError(f'{prefix}: unable to convert record to API data?? {item=}')
+
+def _db_rec_to_api_value__obj(klass,rec,parent):
+    'Convert DB record to API value, without any attributes (for objects)'
+    ret={}
+    meta=ret['_meta']=rec.pop('_meta',{})
+    meta|=dict(id=str(rec.pop('_id')),type=klass)
+    if parent is not None: meta['parent']=parent
+    return ret
+
+def _api_value_to_db_rec__obj(data):
+    'Convert API value to DB record, without attribute (for objects)'
+    ret={}
+    # transfer selected metadata to the new object, if any
+    # data contains metadata if it is a dump from an existing instance
+    meta=data.pop('_meta',None)
+    if meta is not None: ret['_meta']={'upstream':meta['id']}
+    return ret
+
+
+class PatchData(pydantic.BaseModel):
+    path: str
+    data: dict
+
+@app.patch('/{db}/{type}/{id}')
+def dms_api_object_patch(db:str,type:str,id:str,patchData:PatchData):
+    path,data=patchData.path,patchData.data
+    R=_resolve_path_head(db=db,type=type,id=id,path=path)
+    if len(R.tail)==0: raise ValueError('Objects cannot be patched (only attributes can)')
+    assert len(R.tail)==1
+    attr,index=R.tail[0]
+    if index is not None: raise ValueError('Path {path} indexes an attribute (only whole attribute can be set, not its components).')
+    item=GG.schema_get_type(db,R.type)[attr]
+    assert item.link is None
+    rec=_api_value_to_db_rec__attr(item,data,f'{R.type}:{path}')
+    r=GG.db_get(db)[R.type].find_one_and_update(
+        {'_id':bson.objectid.ObjectId(R.id)}, # filter
+        {'$set':{attr:rec}}, # update
+    )
+    if r is None: raise RuntimeError(f'{db}/{R.type}/{R.id} not found for update?')
+
 
 @app.post('/{db}/{type}')
 def dms_api_object_post(db: str, type:str,data:dict) -> str:
     def _new_object(klass,dta,path,tracker):
         klassSchema=GG.schema_get_type(db,klass)
-        rec=dict()
-        meta=dta.pop('_meta',None)
-        # only transfer selected metadata
-        if meta is not None: rec['_meta']={'upstream':meta['_id']}
+        rec=_api_value_to_db_rec__obj(dta)
         for key,val in dta.items():
             if not key in klassSchema: raise AttributeError(f'Invalid attribute {klass}.{key} (hint: {klass} defines: {", ".join(klassKeys)}).')
             item=klassSchema[key]
@@ -303,17 +368,7 @@ def dms_api_object_post(db: str, type:str,data:dict) -> str:
                         return tracker.resolve_relpath_to_id(relpath=obj,curr=path)
                     else: raise ValueError('{klass}.{key}: must be dict, object ID or relative path (not a {obj.__class__.__name__})')
                 rec[key]=_apply_link(item,val,_handle_link)
-            elif item.dtype=='str':
-                if not isinstance(val,str): raise TypeError(f'{klass.key} must be str (not a {val.__class__.__name__})')
-                rec[key]=val
-            elif item.dtype=='bytes':
-                if not isinstance(val,str): raise TypeError('{klass.key} must be a str (base64-encoded perhaps).')
-                rec[key]=val
-            elif item.dtype=='object':
-                rec[key]=json.loads(json.dumps(val))
-            else: # quantity
-                q=_validated_quantity(item,val)
-                rec[key]=_quantity_to_dict(q)
+            else: rec[key]=_api_value_to_db_rec__attr(item,val,f'{klass}.{key}')
         ins=GG.db_get(db)[klass].insert_one(rec)
         idStr=str(ins.inserted_id)
         tracker.add_tracked_object(path,idStr)
@@ -364,12 +419,10 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
         if tracker and (p:=tracker.resolve_id_to_relpath(id=dbId,curr=path)): return p
         if max_level>=0 and len(path)>max_level: return {}
         klassSchema,obj=GG.db_get_schema_object(db,klass,dbId)
-        ret={}
-        meta=ret['_meta']=obj.pop('_meta',{})
-        meta|=dict(_id=str(obj.pop('_id')),type=klass)
-        if parentId is not None: meta['parent']=parentId
+        ret=_db_rec_to_api_value__obj(klass,obj,parentId)
         if not meta: ret.pop('_meta')
         for key,val in obj.items():
+            if key=='_meta': continue
             if not key in klassSchema: raise AttributeError(f'Invalid stored attribute {klass}.{key} (not in schema).')
             item=klassSchema[key]
             if item.link is not None:
@@ -380,12 +433,11 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
                     return _get_object(i.link,obj,parentId=dbId,path=path+[(key,index)],tracker=tracker)
                 ret[key]=_apply_link(item,val,_resolve)
             else:
-                ret[key]=val
+                ret[key]=_db_rec_to_api_value__attr(item,val,f'{klass}.{key}')
         if tracker: tracker.add_tracked_object(path,dbId)
         return ret
     shallow_=set(shallow.split())
     # print(f'{shallow_=}')
-    root=(type,id)
     R=_resolve_path_head(db=db,type=type,id=id,path=path)
 
     if len(R.tail)==0:
@@ -398,7 +450,7 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
     if index is not None: raise ValueError(f'Path {path} indexes an attribute (indexing is only allowed within link array)')
     item=GG.schema_get_type(db,R.type)[attr]
     assert item.link is None
-    return R.obj[attr]
+    return _db_rec_to_api_value__attr(item,R.obj[attr],f'{R.type}.{attr}')
 
 
 @app.get('/{db}')
