@@ -94,8 +94,12 @@ def _flatten(items, ignore_types=(str, bytes)):
         else: yield x
 
 import numpy as np
-import collections.abc as abc
-Seq=abc.Sequence
+import sys
+# backwards-compatible Sequence generic
+# https://stackoverflow.com/a/71610402
+if sys.version_info<(3,9): from typing import Sequence
+else: from collections.abc import Sequence
+Seq=Sequence
 
 @pydantic.validate_arguments()
 def _validated_quantity_2(
@@ -139,7 +143,7 @@ def _validated_quantity(item: ItemSchema, data):
     passes that to _validated_quantity_2, which will do the proper data check and conversions;
     returns validated quantity as either np.array or astropy.units.Quantity
     '''
-    if isinstance(data,abc.Sequence): return _validated_quantity_2(item,data)
+    if isinstance(data,Sequence): return _validated_quantity_2(item,data)
     elif isinstance(data,dict):
         if extras:=(data.keys()-{'value','unit'}):
             raise ValueError(f'Quantity has extra keywords: {", ".join(extras)} (only value, unit allowed).')
