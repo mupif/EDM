@@ -286,7 +286,7 @@ class _ObjectTracker:
         for common in itertools.count(start=0):
             if curr[:common+1]!=abspath[:common+1]: break
         #print(f'{common=}')
-        return (len(curr)-common-1)*'.'+_unparse_path(abspath[common:])
+        return (len(curr)-common)*'.'+_unparse_path(abspath[common:])
 
 
 def _api_value_to_db_rec__attr(item,val,prefix):
