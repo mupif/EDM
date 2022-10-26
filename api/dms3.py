@@ -120,8 +120,9 @@ def _validated_quantity_2(
     assert item.link is None
     # 1. create np.array
     # 1a. check numeric type convertibility (must be done item-by-item; perhaps can be optimized later?)
-    for it in _flatten(value):
-        if not np.can_cast(it,item.dtype,casting='same_kind'): raise ValueError(f'Type mismatch: item {it} cannot be cast to dtype {cls.dtype} (using same_kind)')
+    if isinstance(value,Sequence):
+        for it in _flatten(value):
+            if not np.can_cast(it,item.dtype,casting='same_kind'): raise ValueError(f'Type mismatch: item {it} cannot be cast to dtype {cls.dtype} (using same_kind)')
     np_val=np.array(value,dtype=item.dtype)
     # 1b. check shape
     if len(item.shape) is not None:
@@ -148,6 +149,7 @@ def _validated_quantity(item: ItemSchema, data):
         if extras:=(data.keys()-{'value','unit'}):
             raise ValueError(f'Quantity has extra keywords: {", ".join(extras)} (only value, unit allowed).')
         return _validated_quantity_2(item,data['value'],data.get('unit',None))
+    else: return _validated_quantity_2(item,value=data,unit=None)
     
 def _parse_path(path: str) -> [(str,Optional[int])]:
     '''
@@ -359,7 +361,7 @@ def dms_api_object_post(db: str, type:str,data:dict) -> str:
         klassSchema=GG.schema_get_type(db,klass)
         rec=_api_value_to_db_rec__obj(dta)
         for key,val in dta.items():
-            if not key in klassSchema: raise AttributeError(f'Invalid attribute {klass}.{key} (hint: {klass} defines: {", ".join(klassKeys)}).')
+            if not key in klassSchema: raise AttributeError(f'Invalid attribute {klass}.{key} (hint: {klass} defines: {", ".join(klassSchema.keys())}).')
             item=klassSchema[key]
             if item.link is not None:
                 if len(item.shape)>0 and not isinstance(val,list): raise ValueError(f'{klass}.{key} should be list (not a {val.__class__.__name__}).')
@@ -418,7 +420,7 @@ def dms_api_path_clone_get(db:str,type:str,id:str,shallow:str='') -> str:
 # FIXME: shallow is space-delimited list
 #
 @app.get('/{db}/{type}/{id}')
-def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1, tracking=False, meta=True, shallow:str='') -> dict:
+def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:int=-1, tracking:bool=False, meta:bool=True, shallow:str='') -> dict:
     def _get_object(klass,dbId,parentId,path,tracker):
         if tracker and (p:=tracker.resolve_id_to_relpath(id=dbId,curr=path)): return p
         if max_level>=0 and len(path)>max_level: return {}
@@ -484,8 +486,8 @@ class GG(object):
     @staticmethod
     def db_get_schema_object(db:str,klass:str,dbId:str):
         obj=GG.db_get(db)[klass].find_one({'_id':bson.objectid.ObjectId(dbId)})
+        if obj is None: raise KeyError(f'No object {klass} with id={dbId} in the database {db}')
         assert str(obj['_id'])==dbId
-        if obj is None: raise KeyError('No object {klass} with id={dbId} in the database')
         return GG.schema_get_type(db,klass),obj
     @staticmethod
     def schema_get(db:str):
