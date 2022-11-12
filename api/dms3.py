@@ -101,10 +101,21 @@ if sys.version_info<(3,9): from typing import Sequence
 else: from collections.abc import Sequence
 Seq=Sequence
 
+from pydantic import StrictInt, StrictFloat
+
+# validation with plain int (coming before float, as before) will corrode float to int
+# see https://pydantic-docs.helpmanual.io/usage/models/#data-conversion
+# use StrictFloat and StrictInt instead
 @pydantic.validate_arguments()
 def _validated_quantity_2(
         item: ItemSchema,
-        value: Union[int,float,Seq[int],Seq[float],Seq[Seq[int]],Seq[Seq[float]],Seq[Seq[Seq[int]]],Seq[Seq[Seq[float]]],Seq[Seq[Seq[Seq[int]]]],Seq[Seq[Seq[Seq[float]]]]],
+        value: Union[
+            StrictFloat,StrictInt,
+            Seq[StrictFloat],Seq[StrictInt],
+            Seq[Seq[StrictFloat]],Seq[Seq[StrictInt]],
+            Seq[Seq[Seq[StrictFloat]]],Seq[Seq[Seq[StrictInt]]],
+            Seq[Seq[Seq[Seq[StrictFloat]]]],Seq[Seq[Seq[Seq[StrictInt]]]]
+        ],
         unit: Optional[str]=None
     ):
     '''
@@ -118,6 +129,7 @@ def _validated_quantity_2(
     Returns np.array (no unit in the schema) or astropy.unit.Quantity (in schema units).
     '''
     assert item.link is None
+    print(f'{item.dtype=} {value=}')
     # 1. create np.array
     # 1a. check numeric type convertibility (must be done item-by-item; perhaps can be optimized later?)
     if isinstance(value,Sequence):
@@ -132,6 +144,7 @@ def _validated_quantity_2(
     # 2. handle units
     # 2a. schema has unit, data does not; or vice versa
     if (unit is None)!=(item.unit is None): raise ValueError(f'Unit mismatch: item {it} stored unit is {unit} but schema unit is {item.unit}')
+    print(f'{item.dtype=} {unit=} {np_val=}')
     
     # 2b. no unit, return np_val only
     if item.unit is None: return np_val
