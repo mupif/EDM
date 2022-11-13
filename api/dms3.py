@@ -129,7 +129,6 @@ def _validated_quantity_2(
     Returns np.array (no unit in the schema) or astropy.unit.Quantity (in schema units).
     '''
     assert item.link is None
-    print(f'{item.dtype=} {value=}')
     # 1. create np.array
     # 1a. check numeric type convertibility (must be done item-by-item; perhaps can be optimized later?)
     if isinstance(value,Sequence):
@@ -144,7 +143,6 @@ def _validated_quantity_2(
     # 2. handle units
     # 2a. schema has unit, data does not; or vice versa
     if (unit is None)!=(item.unit is None): raise ValueError(f'Unit mismatch: item {it} stored unit is {unit} but schema unit is {item.unit}')
-    print(f'{item.dtype=} {unit=} {np_val=}')
     
     # 2b. no unit, return np_val only
     if item.unit is None: return np_val
