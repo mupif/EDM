@@ -3,6 +3,7 @@ from typing import Literal,Optional,Union,Tuple,List,Set,Dict,Any
 import json
 import typing
 import re
+import os.path
 import astropy.units as au
 from rich.pretty import pprint
 
@@ -614,7 +615,7 @@ class GG(object):
              GG.schema_import(db,json_str)
 
 GG.client_set(pymongo.MongoClient("localhost",27017))
-GG.schema_import_maybe('dms0',open('dms-schema.json').read())
+GG.schema_import_maybe('dms0',open(os.path.dirname(__file__)+'/dms-schema.json').read())
 
 
 

@@ -2,3 +2,5 @@ fastapi
 networkx
 astropy
 rich
+pytest-rich
+pytest
