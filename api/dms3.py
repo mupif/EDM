@@ -356,7 +356,7 @@ class _ObjectTracker:
             assert dot!=0
             if dot>0: head,tail=tail[:dot],tail[dot+1:]
             else: head,tail=tail,''
-            if m:=re.match('^(.*)\[([0-9])+\]$',head): name,ix=m.groups(1),int(m.groups(2))
+            if m:=re.match(r'^(.*)\[([0-9])+\]$',head): name,ix=m.groups(1),int(m.groups(2))
             else: name,ix=head,None
             where.append(_PathEntry(attr=name,index=ix))
             if tail=='': break
