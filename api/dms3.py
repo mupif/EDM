@@ -1,5 +1,5 @@
 import pydantic 
-from typing import Literal,Optional,Union,Tuple,List,Set,Dict
+from typing import Literal,Optional,Union,Tuple,List,Set,Dict,Any
 import json
 import typing
 import re
@@ -418,25 +418,33 @@ def _api_value_to_db_rec__obj(data):
 
 class PatchData(pydantic.BaseModel):
     path: str
-    data: dict
+    data: Union[List[Dict[str,Any]],Dict[str,Any]]
 
 @app.patch('/{db}/{type}/{id}')
 def dms_api_object_patch(db:str,type:str,id:str,patchData:PatchData):
     path,data=patchData.path,patchData.data
     RR=_resolve_path_head(db=db,type=type,id=id,path=path)
-    if RR.isPlain: data=[data]
-    if len(RR)!=len(data): raise ValueError('Resolved patch paths and data length mismatch: {len(RR)} paths, {len(data)} data.')
-    for R in RR:
+
+    # validate inputs
+    if RR.isPlain:
+        if not isinstance(data,dict): raise ValueError('Patch data must be dict for plain (non-wildcard) paths (not a {type(data).__name__}).')
+        data=[data]
+    elif not isinstance(data,list): raise ValueError('Patch data must be a list for wildcard paths (not a {type(data).__name__}).')
+    if len(RR)!=len(data):
+        raise ValueError(f'Resolved patch paths and data length mismatch: {len(RR)} paths, {len(data)} data.')
+
+    # write the data now
+    for R,dat in zip(RR,data):
         if len(R.tail)==0: raise ValueError('Objects cannot be patched (only attributes can)')
         assert len(R.tail)==1
         ent=R.tail[0]
         if ent.index is not None: raise ValueError('Path {path} indexes an attribute (only whole attribute can be set, not its components).')
         item=GG.schema_get_type(db,R.type)[ent.attr]
         assert item.link is None
-        rec=_api_value_to_db_rec__attr(item,data,f'{R.type}:{path}')
+        rec=_api_value_to_db_rec__attr(item,dat,f'{R.type}:{path}')
         r=GG.db_get(db)[R.type].find_one_and_update(
             {'_id':bson.objectid.ObjectId(R.id)}, # filter
-            {'$set':{attr:rec}}, # update
+            {'$set':{ent.attr:rec}}, # update
         )
         if r is None: raise RuntimeError(f'{db}/{R.type}/{R.id} not found for update?')
 
