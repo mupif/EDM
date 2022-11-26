@@ -161,63 +161,80 @@ def _validated_quantity(item: ItemSchema, data):
             raise ValueError(f'Quantity has extra keywords: {", ".join(extras)} (only value, unit allowed).')
         return _validated_quantity_2(item,data['value'],data.get('unit',None))
     else: return _validated_quantity_2(item,value=data,unit=None)
-    
-def _parse_path(path: str) -> [(str,Optional[int])]:
+
+
+class _PathEntry(pydantic.BaseModel):
+    class Config:
+        allow_mutation = False
+
+    attr: str
+    index: Optional[int]=None
+    # slice: Optional[slice]=None
+    ## TODO:
+    # filter: 
+    def hasPlainIndex(self):
+        if self.index is not None:
+            # assert self.slice is None
+            return True
+        return False
+    def to_str(self):
+        return self.attr+(f'[{self.index}]' if self.index is not None else '')
+    # def __hash__(self): # return id(self)
+
+def _parse_path(path: str) -> [_PathEntry]:
     '''
-    Parses path *p* in dot notation, returning list of [(stem,index),...], where index is possibly None. For example:
-    
-    dot[1].notation → [('dot',1),('notation',None)]
+    Parses path *p* in dot notation, returning list of _PathEntry. For example:
+
+    dot[1].notation → [_PathEntry(attr='dot',index=1),_PathEntry(attr='notation',index=None)]
     '''
     if path=='' or path is None: return []
     pp=path.split('.')                      # split by ., dot may not appear inside [..] anyway
     pat=re.compile(r'''                  # no whitespace allowed in the expression
-        (?P<stem>[a-zA-Z][a-zA-Z0-9_]*)  # stem: starts with letter, may continue with letters/numbers/_
+        (?P<attr>[a-zA-Z][a-zA-Z0-9_]*)  # attr: starts with letter, may continue with letters/numbers/_
         (\[(?P<index>[0-9]+)\])?         # optional index: decimals insides [...]
     ''',re.X)
     def _int_or_none(o): return None if o is None else int(o)
     def _match_part(p):
         match=pat.match(p)
         if match is None: raise ValueError(f'Failed to parse path {path} (component {p}).')
-        return match['stem'],_int_or_none(match['index'])
+        return _PathEntry(attr=match['attr'],index=_int_or_none(match['index']))
     return [_match_part(p) for p in pp]
 def _unparse_path(path: [(str,Optional[int])]):
-    return '.'.join([stem+(f'[{index}]' if index is not None else '') for stem,index in path])
-    
+    return '.'.join([ent.to_str() for ent in path])
+
 @pydantic.validate_arguments(config=dict(arbitrary_types_allowed=True))
 def _quantity_to_dict(q: Union[np.ndarray,au.Quantity]) -> dict: 
     if isinstance(q,au.Quantity): return {'value':q.value.tolist(),'unit':str(q.unit)}
     return {'value':q.tolist()}
-
-
 
 @pydantic.dataclasses.dataclass
 class _ResolvedPath(object):
     obj: typing.Any
     type: str
     id: str
-    tail: List[Tuple[str,Optional[int]]]
+    tail: List[_PathEntry]
     parent: Optional[str]
 
 def _resolve_path_head(db: str,type: str, id: str, path: Optional[str]) -> _ResolvedPath:
     '''
     Resolves path head, descending as far as it can get, and returns (klass,dbId),path_tail.
     '''
-    def _descend(klass,dbId,path,level,parentId):
+    def _descend(*,klass,dbId,path,level,parentId):
         klassSchema,obj=GG.db_get_schema_object(db,klass,dbId)
         if len(path)==0: return _ResolvedPath(obj=obj,type=klass,id=dbId,tail=[],parent=None if level==0 else parentId)
         assert len(path)>0
-        attr,index=path[0]
-        item=klassSchema[attr]
+        ent=path[0]
+        item=klassSchema[ent.attr]
         if item.link is not None:
-            if index is not None:
-                if len(item.shape)==0: raise IndexError(f'{klass}.{attr} is scalar, but was indexed with {index}.')
-                linkId=obj[attr][index]
+            if ent.index is not None:
+                if len(item.shape)==0: raise IndexError(f'{klass}.{attr} is scalar, but was indexed with {ent.index}.')
+                linkId=obj[ent.attr][ent.index]
             else:
                 if len(item.shape)>0: raise IndexError(f'{klass}.{attr} is a list, but was not indexed.')
-                linkId=obj[attr]
+                linkId=obj[ent.attr]
             if len(path)==1: return _ResolvedPath(obj=obj,type=item.link,id=linkId,tail=[],parent=parentId) # path leaf
             else:
-                return _descend(klass=item.link,dbId=(obj[attr] if index is None else obj[attr][index]),path=path[1:],level=level+1,parentId=dbId)
+                return _descend(klass=item.link,dbId=(obj[ent.attr] if ent.index is None else obj[ent.attr][ent.index]),path=path[1:],level=level+1,parentId=dbId)
         else:
             return _ResolvedPath(obj=obj,type=klass,id=dbId,tail=path,parent=parentId) # ((klass,dbId),path)
     return _descend(klass=type,dbId=id,path=_parse_path(path),level=0,parentId=id)
@@ -269,8 +286,10 @@ def dms_api_schema_get(db: str,include_id:bool=False):
 class _ObjectTracker:
     path2id: dict=pydantic.dataclasses.Field(default_factory=dict)
     id2path: dict=pydantic.dataclasses.Field(default_factory=dict)
+    def path2key(self,path):
+        return tuple([e.to_str() for e in path])
     def add_tracked_object(self,path,id):
-        self.path2id[tuple(path)]=id
+        self.path2id[self.path2key(path)]=id
         self.id2path[id]=tuple(path)
     def resolve_relpath_to_id(self,*,relpath,curr):
         tail=relpath
@@ -286,10 +305,11 @@ class _ObjectTracker:
             else: head,tail=tail,''
             if m:=re.match('^(.*)\[([0-9])+\]$',head): name,ix=m.groups(1),int(m.groups(2))
             else: name,ix=head,None
-            where.append((name,ix))
+            where.append(_PathEntry(attr=name,index=ix))
             if tail=='': break
-        if tuple(where) not in self.path2id: raise RuntimeError(f'Unable to resolve "{relpath}" relative to "{curr}" (known objects: {" ".join([_unparse_path(p) for p in self.path2id.keys()])}')
-        return self.path2id[tuple(where)]
+        key=self.path2key(where)
+        if key not in self.path2id: raise RuntimeError(f'Unable to resolve "{relpath}" relative to "{curr}" (known objects: {" ".join([_unparse_path(p) for p in self.path2id.keys()])}')
+        return self.path2id[key]
     def resolve_id_to_relpath(self,*,id,curr):
         abspath=self.id2path.get(id,None)
         if abspath is None: return None
@@ -354,9 +374,9 @@ def dms_api_object_patch(db:str,type:str,id:str,patchData:PatchData):
     R=_resolve_path_head(db=db,type=type,id=id,path=path)
     if len(R.tail)==0: raise ValueError('Objects cannot be patched (only attributes can)')
     assert len(R.tail)==1
-    attr,index=R.tail[0]
-    if index is not None: raise ValueError('Path {path} indexes an attribute (only whole attribute can be set, not its components).')
-    item=GG.schema_get_type(db,R.type)[attr]
+    ent=R.tail[0]
+    if ent.index is not None: raise ValueError('Path {path} indexes an attribute (only whole attribute can be set, not its components).')
+    item=GG.schema_get_type(db,R.type)[ent.attr]
     assert item.link is None
     rec=_api_value_to_db_rec__attr(item,data,f'{R.type}:{path}')
     r=GG.db_get(db)[R.type].find_one_and_update(
@@ -367,7 +387,7 @@ def dms_api_object_patch(db:str,type:str,id:str,patchData:PatchData):
 
 
 @app.post('/{db}/{type}')
-def dms_api_object_post(db: str, type:str,data:dict) -> str:
+def dms_api_object_post(db: str, type:str, data:dict) -> str:
     def _new_object(klass,dta,path,tracker):
         klassSchema=GG.schema_get_type(db,klass)
         rec=_api_value_to_db_rec__obj(dta)
@@ -379,7 +399,7 @@ def dms_api_object_post(db: str, type:str,data:dict) -> str:
                 def _handle_link(*,obj,index,key=key,path=path):
                     if _is_object_id(obj): return obj
                     elif isinstance(obj,dict):
-                        return _new_object(item.link,obj,path+[(key,index)],tracker)
+                        return _new_object(item.link,obj,path+[_PathEntry(attr=key,index=index)],tracker)
                     elif isinstance(obj,str):
                         # relative path to an object already created, resolve it...
                         return tracker.resolve_relpath_to_id(relpath=obj,curr=path)
@@ -447,7 +467,7 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
                 def _resolve(*,obj,index,i=item,key=key):
                     # print(f'{i.link} {obj=} {shallow_=}')
                     if obj in shallow_: return obj
-                    return _get_object(i.link,obj,parentId=dbId,path=path+[(key,index)],tracker=tracker)
+                    return _get_object(i.link,obj,parentId=dbId,path=path+[_PathEntry(attr=key,index=index)],tracker=tracker)
                 ret[key]=_apply_link(item,val,_resolve)
             else:
                 ret[key]=_db_rec_to_api_value__attr(item,val,f'{klass}.{key}')
@@ -463,11 +483,11 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
 
     # the result is an attribute which is yet to be obtained from the object
     if len(R.tail)>1: raise ValueError(f'Path {path} has too long tail ({_unparse_path(R.tail)}).')
-    attr,index=R.tail[0]
-    if index is not None: raise ValueError(f'Path {path} indexes an attribute (indexing is only allowed within link array)')
-    item=GG.schema_get_type(db,R.type)[attr]
+    ent=R.tail[0]
+    if ent.index is not None: raise ValueError(f'Path {path} indexes an attribute (indexing is only allowed within link array)')
+    item=GG.schema_get_type(db,R.type)[ent.attr]
     assert item.link is None
-    return _db_rec_to_api_value__attr(item,R.obj[attr],f'{R.type}.{attr}')
+    return _db_rec_to_api_value__attr(item,R.obj[ent.attr],f'{R.type}.{ent.attr}')
 
 
 @app.get('/{db}')
