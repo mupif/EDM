@@ -28,4 +28,4 @@ jobs:
     - name: pytest (native)
       timeout-minutes: 1
       run: |
-        python -m pytest -v api/dms3-test.py
+        python -m pytest -v api/
