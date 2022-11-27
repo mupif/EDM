@@ -170,29 +170,35 @@ class _PathEntry(pydantic.BaseModel):
 
     attr: str
     index: Optional[int]=None
+    multiindex: Optional[List[int]]=None
     slice: Optional[Tuple[Optional[int],Optional[int],Optional[int]]]=None
     ## TODO:
     # filter: ...
 
     def hasSubscript(self):
         'Has index or slice'
-        return not (self.index is None and self.slice is None)
+        return not (self.index is None and self.multiindex is None and self.slice is None)
     def isPlain(self):
         'No subscript or plain index (cannot exapand to multiple paths)'
-        return self.slice is None
+        return (self.multiindex is None and self.slice is None)
     def subscript(self):
         if not self.hasSubscript(): return ''
         if self.index is not None: return f'[{self.index}]'
-        assert self.slice is not None
-        s0,s1,s2=self.slice
-        return f'[{"" if s0 is None else s0}:{"" if s1 is None else s1}{"" if s2 is None else ":"+str(s2)}]'
+        elif self.multiindex is not None:
+            # trailing comma to distinguish from plain index
+            if len(self.multiindex)==1: return f'[{self.multiindex[0]},]'
+            return f'{",".join([str(i) for i in self.multiindex])}'
+        else:
+            assert self.slice is not None
+            s0,s1,s2=self.slice
+            return f'[{"" if s0 is None else s0}:{"" if s1 is None else s1}{"" if s2 is None else ":"+str(s2)}]'
     def to_str(self): return self.attr+self.subscript()
-
     def apply_indexing(self,*,obj,klass,item):
         '''
         Returns
         * single-item list for scalar (no subscript)
         * single-item list for lists (index subscript)
+        * list resulting from multiindex
         * list resulting from slicing (possibly empty, slice subscript)
         '''
         scalar=(len(item.shape)==0)
@@ -203,8 +209,10 @@ class _PathEntry(pydantic.BaseModel):
             return [val]
         if scalar: raise IndexError(f'{klass}.{self.attr} is scalar but is indexed with {self.subscript()}')
         if self.index is not None: return [val[self.index]]
-        assert self.slice is not None
-        return val[slice(*self.slice)]
+        elif self.multiindex is not None: return [val[i] for i in self.multiindex]
+        else:
+            assert self.slice is not None
+            return val[slice(*self.slice)]
         # TODO: apply filter
 
 def _parse_path(path: str) -> [_PathEntry]:
@@ -221,9 +229,10 @@ def _parse_path(path: str) -> [_PathEntry]:
         (\[(?P<suffix>
             # plain decimal: single index (negative allowed)
             (?P<ix>[+-]?[0-9]+)
-            |
+            # multiindex: "i,", "i,j", "i,j," .. (trailing comma allowed)
+            |(?P<miix>([+-]?[0-9]+,)+([+-]?[0-9])?)
             # slice: :, i:, i:j, :j, i:j:k, :j:k, i::k, ::k, ::
-            (
+            |(
                 (?P<s0>[+-]?[0-9]+)?:(?P<s1>[+-]?[0-9]+)?:?(?P<s2>[+-]?[0-9]+)?
             )
         )\])?
@@ -236,7 +245,8 @@ def _parse_path(path: str) -> [_PathEntry]:
         if m['suffix'] is None: return _PathEntry(attr=m['attr'])
         else:
             if m['ix'] is not None: return _PathEntry(attr=m['attr'],index=_int_or_none(m['ix']))
-            return _PathEntry(attr=m['attr'],index=None,slice=(_int_or_none(m['s0']),_int_or_none(m['s1']),_int_or_none(m['s2'])))
+            elif m['miix'] is not None: return _PathEntry(attr=m['attr'],multiindex=[int(i) for i in m['miix'].split(',') if len(i)>0])
+            return _PathEntry(attr=m['attr'],slice=(_int_or_none(m['s0']),_int_or_none(m['s1']),_int_or_none(m['s2'])))
     ret=[_match_part(p) for p in pp]
     return ret
 

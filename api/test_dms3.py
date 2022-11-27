@@ -142,27 +142,32 @@ class Test_Direct(unittest.TestCase):
         C.ID0=dms3.dms_api_object_list(db=DB,type='BeamState')[0]
     def test_02_parse(self):
         C=self.__class__
+        N=None
         for p,res in [
-            ('foo',[('foo',None,None)]),
-            ('foo.bar',[('foo',None,None),('bar',None,None)]),
-            ('foo[1].bar',[('foo',1,None),('bar',None,None)]),
-            ('foo[1].bar[2]',[('foo',1,None),('bar',2,None)]),
-            ('foo[-1].bar',[('foo',-1,None),('bar',None,None)]),
-            ('foo[:]',[('foo',None,(None,None,None))]),
-            ('foo[::]',[('foo',None,(None,None,None))]),
-            ('foo[1:]',[('foo',None,(1,None,None))]),
-            ('foo[1::]',[('foo',None,(1,None,None))]),
-            ('foo[1:2]',[('foo',None,(1,2,None))]),
-            ('foo[1:2:]',[('foo',None,(1,2,None))]),
-            ('foo[1:2:3]',[('foo',None,(1,2,3))]),
-            ('foo[:2:3]',[('foo',None,(None,2,3))]),
-            ('foo[1::3]',[('foo',None,(1,None,3))]),
-            ('foo[::3]',[('foo',None,(None,None,3))])
+            ('a',        [('a',N,N,N)]),
+            ('a.b',      [('a',N,N,N),('b',N,N,N)]),
+            ('a[1].b',   [('a',1,N,N),('b',N,N,N)]),
+            ('a[1].b[2]',[('a',1,N,N),('b',2,N,N)]),
+            ('a[-1].b',  [('a',-1,N,N),('b',N,N,N)]),
+            ('a[:]',     [('a',N,N,(N,N,N))]),
+            ('a[::]',    [('a',N,N,(N,N,N))]),
+            ('a[1:]',    [('a',N,N,(1,N,N))]),
+            ('a[1::]',   [('a',N,N,(1,N,N))]),
+            ('a[1:2]',   [('a',N,N,(1,2,N))]),
+            ('a[1:2:]',  [('a',N,N,(1,2,N))]),
+            ('a[1:2:3]', [('a',N,N,(1,2,3))]),
+            ('a[:2:3]',  [('a',N,N,(N,2,3))]),
+            ('a[1::3]',  [('a',N,N,(1,N,3))]),
+            ('a[::3]',   [('a',N,N,(N,N,3))]),
+            ('a[1,]',    [('a',N,[1],N)]),
+            ('a[1,2]',   [('a',N,[1,2],N)]),
+            ('a[1,2,3]', [('a',N,[1,2,3],N)]),
+            ('a[1,].b[:3:-1].c[0].d', [('a',N,[1,],N),('b',N,N,(N,3,-1)),('c',0,N,N),('d',N,N,N)]),
         ]:
             pp=dms3._parse_path(p)
             self.assertEqual(len(res),len(pp))
             for r,p in zip(res,pp):
-                self.assertEqual(r,(p.attr,p.index,p.slice))
+                self.assertEqual(r,(p.attr,p.index,p.multiindex,p.slice))
     def test_03_resolve(self):
         C=self.__class__
         # single expanded path (no wildcards)
@@ -194,6 +199,10 @@ class Test_Direct(unittest.TestCase):
         # combined wildcards: each [:] has 2 items, thus 6 is returned
         names=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[:].rveStates[:].rve.materials[:].name')
         self.assertEqual(names,3*['mat0','mat1'])
+        # reverse slice and explicit reverse multiindex return the same
+        a1=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[::-1].bendingMoment')
+        a2=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[1,0].bendingMoment')
+        self.assertEqual(a1,a2)
     def test_05_set(self):
         C=self.__class__
         ##
