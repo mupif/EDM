@@ -168,6 +168,10 @@ class Test_Direct(unittest.TestCase):
             self.assertEqual(len(res),len(pp))
             for r,p in zip(res,pp):
                 self.assertEqual(r,(p.attr,p.index,p.multiindex,p.slice))
+                self.assertTrue(p.filter is None)
+        for f in ['a>3','a[45[45]]>3','np.sum(123)[233]+[34[1,2,3]]']:
+            pp=dms3._parse_path(f'a[1,2,3].b[2].c[1:2|{f}]')
+            self.assertEqual(pp[2].filter,f)
     def test_03_resolve(self):
         C=self.__class__
         # single expanded path (no wildcards)

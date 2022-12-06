@@ -172,8 +172,7 @@ class _PathEntry(pydantic.BaseModel):
     index: Optional[int]=None
     multiindex: Optional[List[int]]=None
     slice: Optional[Tuple[Optional[int],Optional[int],Optional[int]]]=None
-    ## TODO:
-    # filter: ...
+    filter: Optional[str]=None
 
     def hasSubscript(self):
         'Has index or slice'
@@ -206,14 +205,21 @@ class _PathEntry(pydantic.BaseModel):
         val=obj[self.attr]
         if not self.hasSubscript():
             if not scalar: raise IndexError(f'{klass}.{self.attr} is a list, but was not subscripted (slice with [:] to select the entire list).')
-            return [val]
-        if scalar: raise IndexError(f'{klass}.{self.attr} is scalar but is indexed with {self.subscript()}')
-        if self.index is not None: return [val[self.index]]
-        elif self.multiindex is not None: return [val[i] for i in self.multiindex]
+            ret=[val]
         else:
-            assert self.slice is not None
-            return val[slice(*self.slice)]
-        # TODO: apply filter
+            if scalar: raise IndexError(f'{klass}.{self.attr} is scalar but is indexed with {self.subscript()}')
+            if self.index is not None: ret=[val[self.index]]
+            elif self.multiindex is not None: ret=[val[i] for i in self.multiindex]
+            else:
+                assert self.slice is not None
+                ret=val[slice(*self.slice)]
+        return ret
+    #def apply_filtering(self,*
+    #    # apply filters to the return value
+    #    #def filter_pass(obj):
+    #    #    if self.filter: warnings.warn('Filtering not yet implemented (with {self.filter=})')
+    #    #    return true
+    #    #return [obj for obj in val if filter_pass(obj)]
 
 def _parse_path(path: str) -> [_PathEntry]:
     '''
@@ -221,34 +227,41 @@ def _parse_path(path: str) -> [_PathEntry]:
 
     dot[1].not.ation[::-1] → [_PathEntry(attr='dot',index=1),_pathEntry(attr='not'),_PathEntry(attr='ation',slice=(None,None,-1))]
     '''
+    import parsy as P
     if path=='' or path is None: return []
-    pp=path.split('.')                      # split by ., dot may not appear inside [..] anyway
-    pat=re.compile(r'''                  # no whitespace allowed in the expression
-        (?P<attr>[a-zA-Z][a-zA-Z0-9_]*)  # attr: starts with letter, may continue with letters/numbers/_
-        # suffix is in [...]
-        (\[(?P<suffix>
-            # plain decimal: single index (negative allowed)
-            (?P<ix>[+-]?[0-9]+)
-            # multiindex: "i,", "i,j", "i,j," .. (trailing comma allowed)
-            |(?P<miix>([+-]?[0-9]+,)+([+-]?[0-9])?)
-            # slice: :, i:, i:j, :j, i:j:k, :j:k, i::k, ::k, ::
-            |(
-                (?P<s0>[+-]?[0-9]+)?:(?P<s1>[+-]?[0-9]+)?:?(?P<s2>[+-]?[0-9]+)?
-            )
-        )\])?
-        $
-    ''',re.X)
-    def _int_or_none(o): return None if o is None else int(o)
-    def _match_part(p):
-        m=pat.match(p)
-        if m is None: raise ValueError(f'Failed to parse path {path} (component {p}).')
-        if m['suffix'] is None: return _PathEntry(attr=m['attr'])
-        else:
-            if m['ix'] is not None: return _PathEntry(attr=m['attr'],index=_int_or_none(m['ix']))
-            elif m['miix'] is not None: return _PathEntry(attr=m['attr'],multiindex=[int(i) for i in m['miix'].split(',') if len(i)>0])
-            return _PathEntry(attr=m['attr'],slice=(_int_or_none(m['s0']),_int_or_none(m['s1']),_int_or_none(m['s2'])))
-    ret=[_match_part(p) for p in pp]
-    return ret
+
+    none=P.string('').result(None)
+    dec=P.regex('[+-]?[0-9]+').map(int).desc('decimal integer')
+    dec_none=(dec|none).desc('possibly-empty-decimal')
+    colon,comma,dot,pipe=P.string(':'),P.string(','),P.string('.'),P.string('|')
+    lbrack,rbrack=P.string('['),P.string(']')
+
+    balanced=P.forward_declaration()
+    bracketed=P.seq(lbrack,balanced,rbrack).concat() # concat as string, don't need component access
+    plain=P.regex('[^[\]]+') # any string without []
+    balanced.become((plain|bracketed).many().concat().desc('balanced-expression'))
+
+    # subscript
+    index=dec.map(int).tag('index')
+    multiindex=((dec<<comma).times(1,float('inf'))+dec.times(0,1)).tag('multiindex')
+    slice=(dec_none).sep_by(colon,min=2,max=3).tag('slice')
+    filter=((pipe>>balanced)|none).tag('filter')
+    subscript=(lbrack>>P.seq(slice|multiindex|index,filter)<<rbrack).combine_dict(dict)
+    # identifier
+    attr=P.regex('[a-zA-Z_][a-zA-Z_0-9]*')
+
+    def mk_dotpath(vv):
+        def mk_entry(v):
+            d={'attr':v['attr']}|dict(v['sub'] if v['sub'] is not None else {})
+            # expand 2-tuple slice to 3-tuple
+            if 'slice' in d and len(d['slice'])==2: d['slice']=d['slice']+[None]
+            return _PathEntry(**d)
+        return [mk_entry(v) for v in vv]
+    # dot-separated identifier with optional subscript
+    dotpath=P.seq(attr=attr,sub=subscript|none).sep_by(dot).map(mk_dotpath)
+
+    return dotpath.parse(path)
+
 
 def _unparse_path(path: [(str,Optional[int])]):
     return '.'.join([ent.to_str() for ent in path])
@@ -283,6 +296,8 @@ def _resolve_path_head(db: str, type: str, id: str, path: Optional[str]) -> _Res
     '''
     def _descend(*,klass,dbId,path,level,parentId,resolved):
         klassSchema,obj=GG.db_get_schema_object(db,klass,dbId)
+        import attrdict
+        obj=attrdict.AttrDict(obj)
         # terminate recursion here
         if len(path)==0:
             resolved+=[_ResolvedPath(obj=obj,type=klass,id=dbId,tail=[],parent=None if level==0 else parentId)]
@@ -301,6 +316,9 @@ def _resolve_path_head(db: str, type: str, id: str, path: Optional[str]) -> _Res
     _descend(klass=type,dbId=id,path=parsed_path,level=0,parentId=None,resolved=resolved)
     isPlain=all([ent.isPlain() for ent in parsed_path])
     assert len(resolved)==1 or not isPlain
+    if not isPlain:
+        # TODO: apply filtering here!
+        pass
     return _ResolvedPaths(paths=resolved,isPlain=isPlain)
 
 
@@ -438,9 +456,9 @@ def dms_api_object_patch(db:str,type:str,id:str,patchData:PatchData):
 
     # validate inputs
     if RR.isPlain:
-        if not isinstance(data,dict): raise ValueError('Patch data must be dict for plain (non-wildcard) paths (not a {type(data).__name__}).')
+        if not isinstance(data,dict): raise ValueError(f'Patch data must be dict for plain (non-wildcard) paths (not a {data.__class__.__name__}).')
         data=[data]
-    elif not isinstance(data,list): raise ValueError('Patch data must be a list for wildcard paths (not a {type(data).__name__}).')
+    elif not isinstance(data,list): raise ValueError(f'Patch data must be a list for wildcard paths (not a {data.__class__.__name__}).')
     if len(RR)!=len(data):
         raise ValueError(f'Resolved patch paths and data length mismatch: {len(RR)} paths, {len(data)} data.')
 

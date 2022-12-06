@@ -7,3 +7,5 @@ pytest-rich
 pytest
 pymongo
 requests
+parsy
+attrdict3
