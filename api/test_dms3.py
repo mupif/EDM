@@ -260,6 +260,18 @@ class Test_Direct(unittest.TestCase):
             data=[]
         )))
 
+    def test_06_filter(self):
+        C=self.__class__
+        # each wildcard expands to two (6 in total) but only material ending with 0 is filtered
+        RR=dms3._resolve_path_head(DB,type='BeamState',id=C.ID0,path='csState[:].rveStates[:].rve.materials[:|name.endswith("0")].name')
+        self.assertEqual(len(RR),3)
+        RR=dms3._resolve_path_head(DB,type='BeamState',id=C.ID0,path='csState[:|eps_axial["value"]<800]')
+        self.assertEqual(len(RR),1)
+        RR=dms3._resolve_path_head(DB,type='BeamState',id=C.ID0,path='csState[:].rveStates[:|sigmaHom["value"]<85]')
+        self.assertEqual(len(RR),2)
+        self.assertRaises(RuntimeError,lambda:dms3._resolve_path_head(DB,type='BeamState',id=C.ID0,path='csState[:|some_nonsense_filter]'))
+
+
 
 if __name__=='__main__':
     unittest.main()

@@ -214,12 +214,6 @@ class _PathEntry(pydantic.BaseModel):
                 assert self.slice is not None
                 ret=val[slice(*self.slice)]
         return ret
-    #def apply_filtering(self,*
-    #    # apply filters to the return value
-    #    #def filter_pass(obj):
-    #    #    if self.filter: warnings.warn('Filtering not yet implemented (with {self.filter=})')
-    #    #    return true
-    #    #return [obj for obj in val if filter_pass(obj)]
 
 def _parse_path(path: str) -> [_PathEntry]:
     '''
@@ -238,7 +232,7 @@ def _parse_path(path: str) -> [_PathEntry]:
 
     balanced=P.forward_declaration()
     bracketed=P.seq(lbrack,balanced,rbrack).concat() # concat as string, don't need component access
-    plain=P.regex('[^[\]]+') # any string without []
+    plain=P.regex(r'[^[\]]+') # any string without []
     balanced.become((plain|bracketed).many().concat().desc('balanced-expression'))
 
     # subscript
@@ -316,10 +310,52 @@ def _resolve_path_head(db: str, type: str, id: str, path: Optional[str]) -> _Res
     _descend(klass=type,dbId=id,path=parsed_path,level=0,parentId=None,resolved=resolved)
     isPlain=all([ent.isPlain() for ent in parsed_path])
     assert len(resolved)==1 or not isPlain
-    if not isPlain:
-        # TODO: apply filtering here!
-        pass
+    if any([ent.filter is not None for ent in parsed_path]):
+        import asteval
+        def filter_predicate(R):
+            for ent in parsed_path:
+                if ent.filter is None: continue
+                proxy=DbAttrProxy(DB=db,klass=R.type,id=R.id)
+                aeval=asteval.Interpreter()
+                aeval.symtable|=proxy._self_dict()
+                pred=aeval(ent.filter)
+                # error during evaluation; raise the first exception and ignore the rest
+                if len(aeval.error)>0:
+                    raise RuntimeError(f'{db}:{R.type}:{R.id}: filter raise exception(s):\n'+'\n'.join(['\n'.join(e.get_error()) for e in aeval.error]))
+                if not isinstance(pred,(bool,int)): raise ValueError(f'{db}:{R.type}:{R.id}: filters must return bool or int, but "{ent.filter}" returned {pred.__class__.__name__} ({pred}).')
+                print(f'{db}:{R.type}:{R.id}: filter "{ent.filter}" → {pred}')
+                if not bool(pred): return False
+            return True
+        resolved=[r for r in resolved if filter_predicate(r)]
     return _ResolvedPaths(paths=resolved,isPlain=isPlain)
+
+
+class DbAttrProxy(object):
+    '''Proxy attribute access for database entries, for use with expression evaluation.'''
+    def __init__(self,DB,klass,id):
+        self.DB,self.klass,self.id=DB,klass,id
+        self.schema,self.vals=GG.db_get_schema_object(self.DB,self.klass,self.id)
+    def __getattr__(self,attr):
+        if attr not in self.schema: raise AttributeError(f'{self.klass}.{attr}: no such attribute.')
+        item=self.schema[attr]
+        if attr not in self.vals: raise ValueError(f'{self.klass}.{attr}: exists in schema but absent from database (id={self.id}).')
+        val=self.vals[attr]
+        if item.link is None:
+            # TODO: preprocess values?
+            # e.g. wrap dicts as attrdict.AttrDict, or convert to astropy.Quantity etc.
+            return val
+        else:
+            # handle links
+            scalar=(len(item.shape)==0)
+            if scalar: return DbAttrProxy(DB=self.DB,klass=item.link,id=val)
+            else: return [DbAttrProxy(DB=self.DB,klass=item.link,id=v) for v in val]
+    def __dir__(self):
+        return self.schema.keys()
+    def __repr__(self):
+        return f'<{self.klass} proxy: DB={self.DB} dbId={self.id}>'
+    def _self_dict(self):
+        'Returns self dictionary, for populating top-level namespace'
+        return dict([(k,self.__getattr__(k)) for k in self.schema.keys() if k in self.vals])
 
 
 @pydantic.dataclasses.dataclass
