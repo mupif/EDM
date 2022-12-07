@@ -9,3 +9,4 @@ pymongo
 requests
 parsy
 attrdict3
+asteval

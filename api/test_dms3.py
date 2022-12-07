@@ -207,6 +207,11 @@ class Test_Direct(unittest.TestCase):
         a1=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[::-1].bendingMoment')
         a2=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[1,0].bendingMoment')
         self.assertEqual(a1,a2)
+        # filtering
+        a3=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[:|len(rveStates)<2]')
+        self.assertEqual(len(a3),1)
+        a4=dms3.dms_api_path_get(DB,type='BeamState',id=C.ID0,path='csState[:|all([rs.sigmaHom["value"]>80 for rs in rveStates])]')
+        self.assertEqual(len(a4),1)
     def test_05_set(self):
         C=self.__class__
         ##
