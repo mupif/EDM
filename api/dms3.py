@@ -323,7 +323,7 @@ def _resolve_path_head(db: str, type: str, id: str, path: Optional[str]) -> _Res
                 if len(aeval.error)>0:
                     raise RuntimeError(f'{db}:{R.type}:{R.id}: filter raise exception(s):\n'+'\n'.join(['\n'.join(e.get_error()) for e in aeval.error]))
                 if not isinstance(pred,(bool,np.bool_,int)): raise ValueError(f'{db}:{R.type}:{R.id}: filters must return bool, np.bool_ or int, but "{ent.filter}" returned {pred.__class__.__module__}.{pred.__class__.__name__} (value {pred}).')
-                print(f'{db}:{R.type}:{R.id}: filter "{ent.filter}" → {pred}')
+                # print(f'{db}:{R.type}:{R.id}: filter "{ent.filter}" → {pred}')
                 if not bool(pred): return False
             return True
         resolved=[r for r in resolved if filter_predicate(r)]
@@ -618,7 +618,7 @@ def dms_api_path_get(db:str,type:str,id:str,path: Optional[str]=None, max_level:
         item=GG.schema_get_type(db,R.type)[ent.attr]
         assert item.link is None
         ret.append(_db_rec_to_api_value__attr(item,R.obj[ent.attr],f'{R.type}.{ent.attr}'))
-    print(f'{path=} {RR.isPlain=} {len(ret)=}')
+    # print(f'{path=} {RR.isPlain=} {len(ret)=}')
     return (ret[0] if RR.isPlain else ret)
 
 
