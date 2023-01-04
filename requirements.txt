@@ -10,3 +10,4 @@ requests
 parsy
 attrdict3
 asteval
+python-multipart

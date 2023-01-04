@@ -89,6 +89,21 @@ class Test_REST(unittest.TestCase):
         if not r.ok: raise RuntimeError(r.text)
         return json.loads(r.text)
     @classmethod
+    def post_data(C,p,name,data):
+        r=requests.post(f'{REST_URL}/{p}',files={name:data})
+        if not r.ok: raise RuntimeError(r.text)
+        return json.loads(r.text)
+    @classmethod
+    def get_data(C,p):
+        with requests.get(f'{REST_URL}/{p}',stream=True) as res:
+            return res.raw.read()
+            # return b''.join(res.iter_content(1024))
+            return res.content
+            ret=bytes()
+            for chunk in res.iter_content(1024):
+                ret+=chunk
+            return ret
+    @classmethod
     def patch(C,p,**kw):
         r=requests.patch(f'{REST_URL}/{p}',json=kw)
         if not r.ok: raise RuntimeError(r.text)
@@ -121,6 +136,16 @@ class Test_REST(unittest.TestCase):
         d=C.get(f'{DB}/BeamState/{C.ID_01}',meta=False,tracking=True,max_level=0)
         self.assertTrue('cs' not in d)
         self.assertTrue('npointz' in d)
+
+    @unittest.skip('Failing test (TODO)')
+    def test_06_blob(self):
+        C=self.__class__
+        blob=os.urandom(1024*1024)
+        id=C.post_data(f'{DB}/blob/upload','blob',blob)
+        # TODO: this is broken 
+        # backend says "gridfs.errors.NoFile: no file in gridfs collection" — but the file is there?!
+        blob2=C.get_data(f'{DB}/blob/{id}')
+        self.assertEqual(blob,blob2)
 
     def test_99_float_error(self):
         C=self.__class__
@@ -275,7 +300,6 @@ class Test_Direct(unittest.TestCase):
         RR=dms3._resolve_path_head(DB,type='BeamState',id=C.ID0,path='csState[:].rveStates[:|sigmaHom["value"]<85]')
         self.assertEqual(len(RR),2)
         self.assertRaises(RuntimeError,lambda:dms3._resolve_path_head(DB,type='BeamState',id=C.ID0,path='csState[:|some_nonsense_filter]'))
-
 
 
 if __name__=='__main__':

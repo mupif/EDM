@@ -12,8 +12,10 @@ import bson
 import builtins
 import string
 import itertools
+import gridfs
+import shutil
 
-
+import fastapi.responses
 from fastapi import FastAPI
 app=FastAPI()
 
@@ -539,6 +541,22 @@ def dms_api_object_post(db: str, type:str, data:dict) -> str:
         tracker.add_tracked_object(path,idStr)
         return idStr
     return _new_object(type,data,path=[],tracker=_ObjectTracker())
+
+@app.post('/{db}/blob/upload')
+def dms_api_blob_upload(db:str,blob: fastapi.UploadFile) -> str:
+    'Streming blob upload'
+    fs=gridfs.GridFS(GG.db_get(db))
+    with fs.new_file() as f:
+        shutil.copyfileobj(blob.file,f)
+        return str(f._id)
+
+@app.get('/{db}/blob/{id}')
+def dms_api_blob_get(db:str,id:str):
+    'Streaming blob download'
+    fs=gridfs.GridFS(GG.db_get(db))
+    def iterfile():
+        yield from fs.get(id)
+    return fastapi.responses.StreamingResponse(iterfile(),media_type="application/octet-stream")
 
 
 #
